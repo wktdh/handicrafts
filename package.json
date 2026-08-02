@@ -1,0 +1,33 @@
+{
+  "name": "shouzuoji-marketplace",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test:backend": "python -m unittest discover -s database/tests -v",
+    "test:frontend": "vitest run",
+    "test:e2e": "playwright test",
+    "test:all": "npm run test:backend && npm run test:frontend && npm run build && npm run test:e2e",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "4.3.4",
+    "lucide-react": "0.468.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "typescript": "5.7.3",
+    "vite": "5.4.14"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.0",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "jsdom": "^25.0.1",
+    "vitest": "^2.1.9"
+  }
+}

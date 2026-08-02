@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS legacy_migrations (
+  seller_user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  migrated_products INTEGER NOT NULL DEFAULT 0,
+  migrated_drafts INTEGER NOT NULL DEFAULT 0,
+  migrated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
