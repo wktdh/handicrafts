@@ -10,6 +10,17 @@ python database/init_db.py
 
 这会创建 `database/handicrafts.db`，依次执行所有迁移和种子数据。脚本可以重复执行，迁移由 `schema_migrations` 表记录。
 
+## 浏览器推送通知
+
+生产服务器安装依赖后生成一次 VAPID 密钥，并将输出写入后端进程的环境变量。私钥只能保存在服务器，不能提交到 Git。
+
+```powershell
+pip install -r requirements.txt
+python database/generate_vapid_keys.py
+```
+
+站点必须使用 HTTPS。卖家登录工作台后点击“开启浏览器消息通知”并允许浏览器权限；之后网页关闭时也能收到买家消息通知。
+
 ## 迁移旧版本地作品
 
 ```powershell

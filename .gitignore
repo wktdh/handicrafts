@@ -17,3 +17,9 @@ test-results/
 .idea/
 .vscode/
 *.iml
+*.pyc
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+database/backups/

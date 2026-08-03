@@ -60,8 +60,9 @@ class ServerDataTestCase(unittest.TestCase):
             migrations = {row[0] for row in connection.execute("SELECT name FROM schema_migrations")}
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             default_sku = connection.execute("SELECT stock FROM product_skus WHERE product_id = 'product-demo-cup' AND id = 'product-demo-cup-default-sku'").fetchone()
-        self.assertTrue({"022_campaign_redemptions.sql", "023_operations_analytics.sql", "024_coupon_wallet.sql", "025_search_operations.sql", "026_user_profile_and_cancellation.sql", "027_messaging_conversations.sql", "028_message_media_links.sql", "029_governance_operations.sql", "030_service_staff_backup.sql", "031_governance_depth.sql", "032_business_operations_depth.sql", "033_activity_order_allocations.sql", "034_order_resource_ledger.sql", "035_customer_service_integrations.sql", "036_seller_verification_lifecycle.sql", "037_coupon_operations.sql", "038_activity_operations.sql", "039_search_operations_analytics.sql", "040_deep_analytics_indexes.sql", "041_governance_service_insights.sql", "042_seller_finance.sql", "043_governance_support_automation.sql", "044_seller_registration_profile.sql", "045_lianlian_payout_binding.sql"}.issubset(migrations))
+        self.assertIn("046_web_push_subscriptions.sql", migrations)
         self.assertTrue({"platform_campaign_redemptions", "platform_campaign_claims", "analytics_events", "search_history", "user_profiles", "account_deletions", "seller_quick_replies", "governance_rules", "enforcement_templates", "governance_tasks", "support_tickets", "support_ticket_messages", "seller_verification_applications", "shop_staff", "database_backup_runs", "governance_rule_versions", "governance_rule_hits", "governance_task_transfers", "governance_task_notes", "governance_case_events", "seller_verification_documents", "shop_staff_audit_logs", "campaign_audiences", "campaign_coupon_codes", "campaign_coupon_issuances", "campaign_coupon_reminders", "platform_activities", "activity_applications", "activity_products", "activity_order_allocations", "order_inventory_allocations", "order_resource_events", "customer_service_conversations", "customer_service_message_links", "customer_service_webhook_events", "search_synonyms", "search_corrections", "search_recommendations", "search_zero_result_rules", "search_query_metrics", "service_automation_rules", "support_ticket_events"}.issubset(tables))
+        self.assertIn("push_subscriptions", tables)
         self.assertIsNotNone(default_sku)
 
     def test_sqlite_connections_enable_wal_and_busy_timeout(self):
@@ -76,6 +77,25 @@ class ServerDataTestCase(unittest.TestCase):
         self.assertIn("Max-Age=1209600", cookie)
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Lax", cookie)
+
+    def test_live_message_hub_fans_out_websocket_events_to_target_users(self):
+        class FakeSocket:
+            def __init__(self):
+                self.frames: list[bytes] = []
+
+            def sendall(self, frame: bytes) -> None:
+                self.frames.append(frame)
+
+        hub = server.LiveMessageHub()
+        seller_one_socket, seller_two_socket, unrelated_socket = FakeSocket(), FakeSocket(), FakeSocket()
+        hub.add("seller-1", seller_one_socket)
+        hub.add("seller-2", seller_two_socket)
+        hub.add("other-user", unrelated_socket)
+        event = {"type": "message.new", "audience": "seller", "shopId": "shop-1"}
+        hub.publish(["seller-1", "seller-2"], event)
+        self.assertEqual(seller_one_socket.frames, [server.websocket_text_frame(event)])
+        self.assertEqual(seller_two_socket.frames, [server.websocket_text_frame(event)])
+        self.assertEqual(unrelated_socket.frames, [])
 
     def test_search_operations_expand_synonyms_and_corrections(self):
         with self.connection() as connection:

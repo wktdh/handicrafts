@@ -13,6 +13,12 @@ import os
 from urllib.parse import parse_qs, urlparse
 from sqlite_config import connect as sqlite_connect
 
+try:
+    from pywebpush import WebPushException, webpush
+except ImportError:  # Allows local API development before the optional push dependency is installed.
+    WebPushException = Exception
+    webpush = None
+
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("HANDICRAFTS_DB_PATH", ROOT / "handicrafts.db"))
@@ -29,12 +35,104 @@ LOGIN_FAILURES: dict[str, list[datetime]] = {}
 ORDER_EXPIRY_SCAN_SECONDS = max(5, int(os.environ.get("HANDICRAFTS_ORDER_EXPIRY_SCAN_SECONDS", "30")))
 CUSTOMER_SERVICE_WEBHOOK_SECRET = os.environ.get("CUSTOMER_SERVICE_WEBHOOK_SECRET", "")
 LIANLIAN_MODE = os.environ.get("HANDICRAFTS_LIANLIAN_MODE", "unconfigured").strip().lower()
+VAPID_PUBLIC_KEY = os.environ.get("HANDICRAFTS_VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("HANDICRAFTS_VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT = os.environ.get("HANDICRAFTS_VAPID_SUBJECT", "mailto:admin@example.com").strip()
 SELLER_OPERATING_CATEGORIES = {
     "布艺缝纫", "黏土&塑形", "滴胶&树脂", "编织", "木质&木艺", "皮具", "首饰", "陶艺陶瓷",
     "刺绣", "花艺干花", "香薰蜡烛 & 香氛", "古风国风", "绘画肌理", "纸品文创", "宠物专属",
     "苔藓微景观", "羊毛毡", "皂类", "非遗",
 }
 SELLER_PAYOUT_METHODS = {"bank_card", "alipay", "wechat"}
+
+
+def websocket_text_frame(payload: dict) -> bytes:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    size = len(body)
+    if size < 126:
+        return bytes((0x81, size)) + body
+    if size < 65536:
+        return bytes((0x81, 126)) + size.to_bytes(2, "big") + body
+    return bytes((0x81, 127)) + size.to_bytes(8, "big") + body
+
+
+class LiveMessageHub:
+    """In-process authenticated WebSocket fan-out for message events."""
+
+    def __init__(self) -> None:
+        self.clients: dict[str, dict[object, threading.Lock]] = {}
+        self.lock = threading.Lock()
+
+    def add(self, user_id: str, client: object) -> None:
+        with self.lock:
+            self.clients.setdefault(user_id, {})[client] = threading.Lock()
+
+    def remove(self, user_id: str, client: object) -> None:
+        with self.lock:
+            clients = self.clients.get(user_id)
+            if not clients:
+                return
+            clients.pop(client, None)
+            if not clients:
+                self.clients.pop(user_id, None)
+
+    def publish(self, user_ids: list[str] | set[str], payload: dict) -> None:
+        frame = websocket_text_frame(payload)
+        with self.lock:
+            recipients = [
+                (user_id, client, send_lock)
+                for user_id in set(user_ids)
+                for client, send_lock in self.clients.get(user_id, {}).items()
+            ]
+        for user_id, client, send_lock in recipients:
+            try:
+                with send_lock:
+                    client.sendall(frame)
+            except OSError:
+                self.remove(user_id, client)
+
+
+LIVE_MESSAGE_HUB = LiveMessageHub()
+
+
+def web_push_is_configured() -> bool:
+    return bool(webpush and VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT)
+
+
+def send_web_push_notifications(user_ids: list[str] | set[str], payload: dict) -> None:
+    """Deliver a payload to stored browser subscriptions and prune expired endpoints."""
+    if not web_push_is_configured() or not user_ids:
+        return
+    recipients = tuple(set(user_ids))
+    with database() as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f"SELECT id, endpoint, subscription_json FROM push_subscriptions WHERE user_id IN ({','.join('?' for _ in recipients)})",
+            recipients,
+        ).fetchall()
+    expired: list[str] = []
+    for row in rows:
+        try:
+            webpush(
+                subscription_info=json.loads(row["subscription_json"]),
+                data=json.dumps(payload, ensure_ascii=False),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_SUBJECT},
+            )
+        except WebPushException as error:
+            response = getattr(error, "response", None)
+            if getattr(response, "status_code", None) in {404, 410}:
+                expired.append(row["id"])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            expired.append(row["id"])
+    if expired:
+        with database() as connection:
+            connection.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(item,) for item in expired])
+
+
+def enqueue_web_push_notifications(user_ids: list[str] | set[str], payload: dict) -> None:
+    if web_push_is_configured() and user_ids:
+        threading.Thread(target=send_web_push_notifications, args=(user_ids, payload), daemon=True).start()
 
 
 class StepUpRequiredError(Exception):
@@ -885,6 +983,19 @@ def seller_shop_permissions(connection: sqlite3.Connection, user_id: str) -> dic
 def seller_accessible_shop_ids(connection: sqlite3.Connection, user_id: str, permission: str | None = None) -> list[str]:
     permissions = seller_shop_permissions(connection, user_id)
     return [shop_id for shop_id, granted in permissions.items() if permission is None or permission in granted]
+
+
+def shop_message_recipient_user_ids(connection: sqlite3.Connection, shop_id: str) -> list[str]:
+    """Return every active owner or staff account allowed to handle this shop's messages."""
+    candidates = [str(row[0]) for row in connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,))]
+    candidates.extend(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT shop_staff.user_id FROM shop_staff JOIN users ON users.id = shop_staff.user_id WHERE shop_staff.shop_id = ? AND shop_staff.status = 'active' AND users.status = 'active'",
+            (shop_id,),
+        )
+    )
+    return [user_id for user_id in dict.fromkeys(candidates) if "messages" in seller_shop_permissions(connection, user_id).get(shop_id, set())]
 
 
 def require_shop_permission(connection: sqlite3.Connection, user_id: str, shop_id: str, permission: str) -> None:
@@ -3148,11 +3259,91 @@ def migrate_legacy_accounts(payload: dict) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def cors_origin(self) -> str:
         origin = self.headers.get("Origin", "")
         if origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:"):
             return origin
         return "http://127.0.0.1:5174"
+
+    def websocket_origin_is_allowed(self) -> bool:
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return False
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if parsed.hostname in {"127.0.0.1", "localhost"}:
+            return True
+        return parsed.netloc.lower() == self.headers.get("Host", "").lower()
+
+    def read_websocket_frame(self) -> tuple[int, bytes] | None:
+        head = self.rfile.read(2)
+        if len(head) != 2:
+            return None
+        opcode = head[0] & 0x0F
+        masked, length = bool(head[1] & 0x80), head[1] & 0x7F
+        if length == 126:
+            raw_length = self.rfile.read(2)
+            if len(raw_length) != 2:
+                return None
+            length = int.from_bytes(raw_length, "big")
+        elif length == 127:
+            raw_length = self.rfile.read(8)
+            if len(raw_length) != 8:
+                return None
+            length = int.from_bytes(raw_length, "big")
+        if not masked or length > 1024 * 1024:
+            return None
+        mask = self.rfile.read(4)
+        body = self.rfile.read(length)
+        if len(mask) != 4 or len(body) != length:
+            return None
+        return opcode, bytes(value ^ mask[index % 4] for index, value in enumerate(body))
+
+    def handle_websocket(self) -> None:
+        user_id = session_user(self)
+        upgrade = self.headers.get("Upgrade", "").lower()
+        connection = self.headers.get("Connection", "").lower()
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        try:
+            valid_key = len(base64.b64decode(key.encode("ascii"), validate=True)) == 16
+        except (ValueError, binascii.Error, UnicodeEncodeError):
+            valid_key = False
+        if not user_id:
+            self.send_json(401, {"error": "Unauthorized"})
+            return
+        if upgrade != "websocket" or "upgrade" not in connection or not valid_key:
+            self.send_json(426, {"error": "WebSocket upgrade required"})
+            return
+        if not self.websocket_origin_is_allowed():
+            self.send_json(403, {"error": "WebSocket origin denied"})
+            return
+        accept = base64.b64encode(hashlib.sha1(f"{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11".encode("ascii")).digest()).decode("ascii")
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.wfile.flush()
+        LIVE_MESSAGE_HUB.add(user_id, self.connection)
+        try:
+            while True:
+                frame = self.read_websocket_frame()
+                if frame is None:
+                    break
+                opcode, body = frame
+                if opcode == 0x8:
+                    self.connection.sendall(bytes((0x88, min(len(body), 125))) + body[:125])
+                    break
+                if opcode == 0x9:
+                    self.connection.sendall(bytes((0x8A, min(len(body), 125))) + body[:125])
+        except OSError:
+            pass
+        finally:
+            LIVE_MESSAGE_HUB.remove(user_id, self.connection)
+            self.close_connection = True
 
     def send_json(self, status: int, payload: dict, cookie: str | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3200,7 +3391,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        if urlparse(self.path).path == "/ws":
+            self.handle_websocket()
+        elif self.path == "/api/push/config":
+            self.send_json(200, {"publicKey": VAPID_PUBLIC_KEY if web_push_is_configured() else None})
+        elif self.path == "/health":
             self.send_json(200, {"ok": True})
         elif self.path.startswith("/media/"):
             self.send_media(self.path.removeprefix("/media/"))
@@ -3984,6 +4179,27 @@ class Handler(BaseHTTPRequestHandler):
                 with database() as connection:
                     accepted = record_customer_service_webhook_event(connection, provider, event_id[:160], event_type[:100], payload)
                 self.send_json(202, {"accepted": accepted, "duplicate": not accepted})
+            elif self.path == "/api/push/subscriptions":
+                user_id = session_user(self)
+                subscription = payload.get("subscription") if isinstance(payload, dict) else None
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                if not web_push_is_configured():
+                    self.send_json(503, {"error": "Browser push is not configured"})
+                    return
+                if not isinstance(subscription, dict):
+                    raise ValueError("Invalid push subscription")
+                endpoint = str(subscription.get("endpoint") or "").strip()
+                keys = subscription.get("keys")
+                if not endpoint.startswith("https://") or len(endpoint) > 2000 or not isinstance(keys, dict) or not str(keys.get("p256dh") or "") or not str(keys.get("auth") or ""):
+                    raise ValueError("Invalid push subscription")
+                with database() as connection:
+                    connection.execute(
+                        "INSERT INTO push_subscriptions (id, user_id, endpoint, subscription_json, user_agent) VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, subscription_json = excluded.subscription_json, user_agent = excluded.user_agent, updated_at = CURRENT_TIMESTAMP",
+                        (f"push-{secrets.token_urlsafe(10)}", user_id, endpoint, json.dumps(subscription, ensure_ascii=False), self.headers.get("User-Agent", "")[:300]),
+                    )
+                self.send_json(201, {"ok": True})
             elif self.path == "/api/campaign-codes/redeem":
                 user_id = session_user(self)
                 if not user_id:
@@ -5090,6 +5306,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请选择订单")
                 if len(content) > 500:
                     raise ValueError("消息不能超过 500 个字符")
+                seller_recipients: list[str] = []
                 with database() as connection:
                     if not connection.execute("SELECT 1 FROM shops WHERE id = ?", (shop_id,)).fetchone():
                         raise ValueError("店铺不存在")
@@ -5101,6 +5318,9 @@ class Handler(BaseHTTPRequestHandler):
                         link_media_assets(connection, [attachment_url], "message", message_id)
                     owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,)).fetchone()
                     if owner: notify_governance(connection, owner[0], "buyer_message", "收到买家消息", content[:80], "shop", shop_id)
+                    seller_recipients = shop_message_recipient_user_ids(connection, shop_id)
+                LIVE_MESSAGE_HUB.publish(seller_recipients, {"type": "message.new", "audience": "seller", "shopId": shop_id, "buyerUserId": user_id, "messageId": message_id})
+                enqueue_web_push_notifications(seller_recipients, {"title": "收到买家消息", "body": content[:80] or "买家发送了一条消息", "tag": f"shop-message-{shop_id}-{user_id}", "url": "/"})
                 self.send_json(201, {"ok": True})
             elif self.path == "/api/messages/seller":
                 user_id = session_user(self)
@@ -5131,6 +5351,8 @@ class Handler(BaseHTTPRequestHandler):
                         link_media_assets(connection, [attachment_url], "message", message_id)
                     notify_governance(connection, buyer_id, "seller_message", "收到店铺回复", content[:80], "shop", shop_id)
                     audit_delegated_shop_operation(connection, user_id, shop_id, "buyer_message_sent", {"messageType": message_type, "buyerUserId": buyer_id})
+                LIVE_MESSAGE_HUB.publish([buyer_id], {"type": "message.new", "audience": "buyer", "shopId": shop_id, "buyerUserId": buyer_id, "messageId": message_id})
+                enqueue_web_push_notifications([buyer_id], {"title": "收到店铺回复", "body": content[:80] or "店铺发送了一条消息", "tag": f"shop-message-{shop_id}", "url": "/"})
                 self.send_json(201, {"ok": True})
             elif self.path == "/api/messages/quick-replies":
                 user_id = session_user(self)
@@ -5801,8 +6023,9 @@ class Handler(BaseHTTPRequestHandler):
                     verification = consume_verification(connection, destination, "password_reset", code)
                     if not verification or not verification["user_id"]:
                         raise ValueError("验证码无效或已过期")
-                    connection.execute("UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (hash_password(password), verification["user_id"]))
+                    connection.execute("UPDATE users SET password_hash = ?, password_changed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (hash_password(password), verification["user_id"]))
                     connection.execute("DELETE FROM web_sessions WHERE user_id = ?", (verification["user_id"],))
+                    write_platform_audit(connection, verification["user_id"], "password_reset", "user", verification["user_id"])
                 self.send_json(200, {"ok": True})
             elif self.path == "/api/auth/change-password":
                 user_id = session_user(self)

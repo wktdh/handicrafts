@@ -519,6 +519,13 @@ function createInitialData(account: Account): AppData {
 // the reverse proxy. Keep the API base relative by default; an absolute
 // VITE_API_BASE can still be supplied for a separately hosted API.
 const API_BASE = (import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE ?? "";
+const websocketUrl = () => {
+  const endpoint = new URL(API_BASE || window.location.origin, window.location.origin);
+  endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+  endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/ws`;
+  endpoint.search = "";
+  return endpoint.toString();
+};
 
 function mergeProducts(current: Product[], incoming: Product[]) {
   return [
@@ -927,7 +934,7 @@ export function AuthScreen({
   ) => Promise<string>;
   onBack: () => void;
 }) {
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const [mode, setMode] = useState<"login" | "register" | "forgot">("login");
   const [name, setName] = useState("");
   const [identifier, setIdentifier] = useState("");
   const [phone, setPhone] = useState("");
@@ -946,6 +953,13 @@ export function AuthScreen({
   const [operatingCategories, setOperatingCategories] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [resetDestination, setResetDestination] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [resetPassword, setResetPassword] = useState("");
+  const [resetConfirmPassword, setResetConfirmPassword] = useState("");
+  const [resetCodeSent, setResetCodeSent] = useState(false);
+  const [resetDevelopmentCode, setResetDevelopmentCode] = useState("");
+  const [sendingResetCode, setSendingResetCode] = useState(false);
   const requestPhoneCode = async () => {
     setError("");
     if (!/^1\d{10}$/.test(phone)) {
@@ -968,8 +982,55 @@ export function AuthScreen({
       setSendingPhoneCode(false);
     }
   };
+  const requestResetCode = async () => {
+    const destination = resetDestination.trim().toLowerCase();
+    if (!/^1\d{10}$/.test(destination) && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(destination)) {
+      setError("请输入已绑定的手机号或邮箱");
+      return;
+    }
+    setError("");
+    setSendingResetCode(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/request-verification`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destination, purpose: "password_reset" }) });
+      const payload = await response.json().catch(() => ({})) as { error?: string; developmentCode?: string };
+      if (!response.ok) return setError(payload.error || "验证码发送失败，请稍后重试");
+      setResetCodeSent(true);
+      setResetDevelopmentCode(payload.developmentCode || "");
+    } catch {
+      setError("服务连接失败，请稍后重试");
+    } finally {
+      setSendingResetCode(false);
+    }
+  };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (mode === "forgot") {
+      const destination = resetDestination.trim().toLowerCase();
+      if (!resetCodeSent || !/^\d{6}$/.test(resetCode) || resetPassword.length < 8) {
+        setError("请填写验证码和至少 8 位的新密码");
+        return;
+      }
+      if (resetPassword !== resetConfirmPassword) {
+        setError("两次输入的新密码不一致");
+        return;
+      }
+      setSubmitting(true);
+      try {
+        const response = await fetch(`${API_BASE}/api/auth/reset-password`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destination, code: resetCode, password: resetPassword }) });
+        const payload = await response.json().catch(() => ({})) as { error?: string };
+        if (!response.ok) return setError(payload.error || "密码重置失败");
+        setMode("login");
+        setIdentifier(destination);
+        setPassword("");
+        setResetCode(""); setResetPassword(""); setResetConfirmPassword(""); setResetDevelopmentCode(""); setResetCodeSent(false);
+        setError("密码已重置，请使用新密码登录");
+      } catch {
+        setError("服务连接失败，请稍后重试");
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     if (mode === "register" && password !== confirmPassword) {
       setError("两次输入的密码不一致");
       return;
@@ -1035,13 +1096,37 @@ export function AuthScreen({
               注册
             </button>
           </div>
-          <h2>{mode === "login" ? "欢迎回来" : "创建你的账户"}</h2>
+          <h2>{mode === "login" ? "欢迎回来" : mode === "forgot" ? "找回密码" : "创建你的账户"}</h2>
           <p>
             {mode === "login"
               ? "登录后继续你的手作之旅。"
+              : mode === "forgot"
+                ? "通过已绑定的手机号或邮箱验证身份后，设置新密码。"
               : "注册后即可浏览、购买或开启个人店铺。"}
           </p>
           <form data-testid="auth-form" onSubmit={submit}>
+            {mode === "forgot" ? <>
+              <label>
+                已绑定的手机号或邮箱
+                <input data-testid="reset-destination" value={resetDestination} onChange={(event) => { setResetDestination(event.target.value); setResetCode(""); setResetCodeSent(false); setResetDevelopmentCode(""); }} placeholder="输入手机号或邮箱" autoComplete="username" />
+              </label>
+              <label>
+                验证码
+                <div className="auth-code-row"><input data-testid="reset-code" value={resetCode} onChange={(event) => setResetCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="输入 6 位验证码" inputMode="numeric" maxLength={6} autoComplete="one-time-code" /><button className="secondary" type="button" onClick={() => void requestResetCode()} disabled={sendingResetCode}>{sendingResetCode ? "发送中…" : resetCodeSent ? "重新获取" : "获取验证码"}</button></div>
+              </label>
+              {resetDevelopmentCode && <small className="auth-hint">开发环境验证码：{resetDevelopmentCode}</small>}
+              <label>
+                新密码
+                <input data-testid="reset-password" value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} placeholder="至少 8 位" type="password" minLength={8} autoComplete="new-password" />
+              </label>
+              <label>
+                确认新密码
+                <input data-testid="reset-confirm-password" value={resetConfirmPassword} onChange={(event) => setResetConfirmPassword(event.target.value)} placeholder="再次输入新密码" type="password" minLength={8} autoComplete="new-password" />
+              </label>
+              {error && <div className="auth-error" role="alert">{error}</div>}
+              <button data-testid="reset-submit" className="primary full" type="submit" disabled={submitting}>{submitting ? "重置中…" : "确认重置密码"}</button>
+              <button className="auth-text-link" type="button" onClick={() => { setMode("login"); setError(""); }}>返回登录</button>
+            </> : <>
             {mode === "register" && sellerStep === 2 ? (
               <div className="seller-registration-step">
                 <label>真实姓名<input data-testid="seller-real-name" value={realName} onChange={(event) => setRealName(event.target.value)} placeholder="填写身份证上的姓名" required /></label>
@@ -1171,6 +1256,8 @@ export function AuthScreen({
             {!(mode === "register" && role === "seller" && sellerStep === 2) && <button data-testid="auth-submit" className="primary full" type="submit" disabled={submitting}>
               {mode === "login" ? "登录" : role === "seller" ? "下一步" : "注册并进入手作集"}
             </button>}
+            {mode === "login" && <button data-testid="auth-forgot-password" className="auth-text-link" type="button" onClick={() => { setMode("forgot"); setError(""); }}>忘记密码？</button>}
+            </>}
           </form>
           <button className="auth-back" onClick={onBack}>
             返回首页
@@ -3133,7 +3220,7 @@ function NotificationCenter({ notifications, onRead, onReadAll, onOpen }: {
   return <div className="container page section"><div className="page-title"><div><h1>通知中心</h1><p>查看订单、售后与平台动态</p></div><button className="secondary" onClick={onReadAll}>全部已读</button></div><div className="order-filters">{[["all","全部"],["unread","未读"],["orders","订单"],["after_sale","售后"],["governance","平台"]].map(([id,label]) => <button key={id} className={filter === id ? "selected" : ""} onClick={() => setFilter(id as typeof filter)}>{label}</button>)}</div><section className="messages-panel">{visible.map((item) => <button className={`message-item ${item.read ? "" : "unread"}`} key={item.id} onClick={() => { if (!item.read) onRead([item.id]); onOpen(item); }}><b>{item.title}</b><span>{item.content}</span><small>{item.createdAt}</small></button>)}{!visible.length && <p>暂无通知。</p>}</section></div>;
 }
 
-function Messages({ role, embedded = false }: { role: "buyer" | "seller"; embedded?: boolean }) {
+function Messages({ role, embedded = false, onUnreadChange }: { role: "buyer" | "seller"; embedded?: boolean; onUnreadChange?: (unread: number) => void }) {
   type Conversation = { shopId: string; shop: string; buyerUserId?: string; buyer?: string; preview: string; lastMessageAt: string; unread: number };
   type SyncedShopMessage = ShopMessage & { cursor?: number };
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -3160,6 +3247,7 @@ function Messages({ role, embedded = false }: { role: "buyer" | "seller"; embedd
     if (!response.ok) throw new Error(payload.error || "消息加载失败");
     const next = payload.conversations || [];
     setConversations(next);
+    onUnreadChange?.(next.reduce((total, item) => total + item.unread, 0));
     if (!keepSelection || !next.some((item) => conversationKey(item) === selectedKey)) {
       setMessages([]);
       messageCursor.current = 0;
@@ -3292,6 +3380,62 @@ function Messages({ role, embedded = false }: { role: "buyer" | "seller"; embedd
       </div>
     </section>
   </div>;
+}
+
+const pushKeyBytes = (value: string) => {
+  const padded = `${value.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - value.length % 4) % 4)}`;
+  const decoded = window.atob(padded);
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+};
+
+function BrowserPushControl() {
+  const [publicKey, setPublicKey] = useState("");
+  const [status, setStatus] = useState<"loading" | "ready" | "enabled" | "denied" | "unavailable" | "error">("loading");
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator) || typeof Notification === "undefined" || !("PushManager" in window)) {
+      setStatus("unavailable");
+      return;
+    }
+    if (Notification.permission === "denied") {
+      setStatus("denied");
+      return;
+    }
+    fetch(`${API_BASE}/api/push/config`, { credentials: "include" })
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((payload: { publicKey?: string | null }) => {
+        if (!payload.publicKey) return setStatus("unavailable");
+        setPublicKey(payload.publicKey);
+        setStatus(Notification.permission === "granted" ? "ready" : "ready");
+      })
+      .catch(() => setStatus("error"));
+  }, []);
+
+  const enable = async () => {
+    try {
+      setStatus("loading");
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") return setStatus("denied");
+      const registration = await navigator.serviceWorker.register("/push-sw.js");
+      const existing = await registration.pushManager.getSubscription();
+      const subscription = existing || await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: pushKeyBytes(publicKey) });
+      const response = await fetch(`${API_BASE}/api/push/subscriptions`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription: subscription.toJSON() }),
+      });
+      if (!response.ok) throw new Error("订阅保存失败");
+      setStatus("enabled");
+    } catch {
+      setStatus("error");
+    }
+  };
+
+  if (status === "unavailable") return <p className="push-notification-hint">浏览器通知暂不可用，需在 HTTPS 环境配置后开启。</p>;
+  if (status === "denied") return <p className="push-notification-hint">浏览器通知已被拦截，请在浏览器站点权限中允许通知。</p>;
+  if (status === "enabled") return <p className="push-notification-hint push-notification-enabled">浏览器通知已开启：网页关闭后也会提醒新消息。</p>;
+  return <div className="push-notification-control"><button className="secondary" type="button" disabled={status === "loading" || !publicKey} onClick={() => void enable()}>{status === "loading" ? "正在开启通知…" : "开启浏览器消息通知"}</button>{status === "error" && <small>开启失败，请确认服务器已配置 VAPID 密钥并使用 HTTPS。</small>}<span>网页关闭后，收到买家消息时也会通知你。</span></div>;
 }
 
 function FavoritesPage({
@@ -4560,6 +4704,7 @@ function Studio({
   const [tab, setTab] = useState<
     "overview" | "products" | "inventory" | "orders" | "messages" | "reviews" | "shipping" | "service" | "promotions" | "finance" | "settings"
   >("overview");
+  const [messageUnread, setMessageUnread] = useState(0);
   const [showForm, setShowForm] = useState(false);
   const [shipmentOrder, setShipmentOrder] = useState<Order | null>(null);
   const [shipmentEventOrder, setShipmentEventOrder] = useState<Order | null>(null);
@@ -4625,6 +4770,7 @@ function Studio({
   const [visitorCount, setVisitorCount] = useState(0);
   const [analyticsDays, setAnalyticsDays] = useState<7 | 30>(30);
   const [analytics, setAnalytics] = useState<{ revenue: number; orders: number; visitors: number; conversionRate: number; pendingFulfillment: number; lowStock: number; refundRate: number } | null>(null);
+  const toastRef = useRef(toast);
   const sellerOrders = orders;
   const validSellerOrders = sellerOrders.filter((order) => order.status !== "已取消");
   const transactionAmount = validSellerOrders.reduce(
@@ -4649,6 +4795,45 @@ function Studio({
       .then((payload: { analytics: typeof analytics }) => setAnalytics(payload.analytics))
       .catch(() => undefined);
   }, [analyticsDays]);
+  useEffect(() => { toastRef.current = toast; }, [toast]);
+  const refreshMessageUnread = async () => {
+    const response = await fetch(`${API_BASE}/api/messages/seller`, { credentials: "include" });
+    const payload = await response.json().catch(() => ({})) as { conversations?: { unread: number }[] };
+    if (response.ok) setMessageUnread((payload.conversations || []).reduce((total, item) => total + item.unread, 0));
+  };
+  useEffect(() => {
+    void refreshMessageUnread().catch(() => undefined);
+    const timer = window.setInterval(() => { void refreshMessageUnread().catch(() => undefined); }, 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (typeof WebSocket === "undefined") return;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let disposed = false;
+    const connect = () => {
+      socket = new WebSocket(websocketUrl());
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(String(event.data)) as { type?: string; audience?: string };
+          if (payload.type !== "message.new" || payload.audience !== "seller") return;
+          void refreshMessageUnread().catch(() => undefined);
+          toastRef.current("收到新的买家消息");
+        } catch {
+          // Ignore malformed push events and keep the connection alive.
+        }
+      };
+      socket.onclose = () => {
+        if (!disposed) reconnectTimer = window.setTimeout(connect, 3000);
+      };
+    };
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, []);
   const conversionRate = visitorCount
     ? `${((validSellerOrders.length / visitorCount) * 100).toFixed(1)}%`
     : "0.0%";
@@ -5299,7 +5484,8 @@ function Studio({
             ) : (
               <Store size={18} />
             )}{" "}
-            {label}
+            <span>{label}</span>
+            {id === "messages" && messageUnread > 0 && <i className="studio-message-unread">{messageUnread > 99 ? "99+" : messageUnread}</i>}
           </button>
         ))}
       </div>
@@ -5322,6 +5508,7 @@ function Studio({
                 发布作品
               </button>
             </div>
+            <BrowserPushControl />
             <div className="order-filters"><button className={analyticsDays === 7 ? "selected" : ""} onClick={() => setAnalyticsDays(7)}>近 7 天</button><button className={analyticsDays === 30 ? "selected" : ""} onClick={() => setAnalyticsDays(30)}>近 30 天</button></div>
             <div className="metric-grid">
               <Metric
@@ -6158,7 +6345,7 @@ function Studio({
           </>
         )}
         {tab === "messages" && (
-          <Messages role="seller" embedded />
+          <Messages role="seller" embedded onUnreadChange={setMessageUnread} />
         )}
         {tab === "reviews" && (
           <>
