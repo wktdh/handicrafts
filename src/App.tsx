@@ -107,6 +107,7 @@ type ProductDraft = {
   images: string[];
   video: string;
   seoTags?: string[];
+  custom: boolean;
   variants: ProductVariant[];
   skus: ProductSku[];
   updatedAt: string;
@@ -312,6 +313,26 @@ type Account = {
   phoneVerified?: boolean;
   emailVerified?: boolean;
 };
+type CommunityComment = {
+  id: string;
+  nickname: string;
+  content: string;
+  createdAt: string;
+  parentCommentId?: string | null;
+  imageUrl?: string | null;
+  imageUrls?: string[];
+};
+type CommunityPost = {
+  id: string;
+  nickname: string;
+  category: string;
+  title: string;
+  content: string;
+  createdAt: string;
+  comments: CommunityComment[];
+  imageUrl?: string | null;
+  imageUrls?: string[];
+};
 type SellerRegistrationProfile = {
   realName: string;
   identityNumber: string;
@@ -339,12 +360,13 @@ type MarketplaceView =
   | "notifications"
   | "profile"
   | "security"
+  | "community"
   | "studio";
 const buyerRestorableViews: MarketplaceView[] = [
   "home", "discover", "cart", "checkout", "orders", "favorites", "coupons", "following",
-  "messages", "notifications", "profile", "security",
+  "messages", "notifications", "profile", "security", "community",
 ];
-const sellerRestorableViews: MarketplaceView[] = ["home", "shop", "studio", "profile", "security", "notifications"];
+const sellerRestorableViews: MarketplaceView[] = ["home", "shop", "studio", "profile", "security", "notifications", "community"];
 
 const productImages = [
   ceramicCupImage,
@@ -357,6 +379,9 @@ const productImages = [
 
 const bundledCatalogImages: Record<string, string> = {
   "product-demo-cup": ceramicCupImage,
+};
+const bundledMediaImages: Record<string, string> = {
+  "local://ceramic-cup.jpg": ceramicCupImage,
 };
 
 const seedProducts: Product[] = [
@@ -526,13 +551,61 @@ const websocketUrl = () => {
   endpoint.search = "";
   return endpoint.toString();
 };
+const communityWebsocketUrl = (visitorId: string) => {
+  const endpoint = new URL(API_BASE || window.location.origin, window.location.origin);
+  endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+  endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/ws/community`;
+  endpoint.search = new URLSearchParams({ visitorId }).toString();
+  return endpoint.toString();
+};
+
+const UPLOAD_IMAGE_MAX_DIMENSION = 2000;
+const UPLOAD_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const UPLOAD_IMAGE_QUALITY = 0.82;
+
+async function compressImageForUpload(file: File): Promise<string> {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+    throw new Error("图片仅支持 JPG、PNG 或 WebP 格式");
+  }
+  const sourceUrl = URL.createObjectURL(file);
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error("图片读取失败"));
+      element.src = sourceUrl;
+    });
+    const scale = Math.min(1, UPLOAD_IMAGE_MAX_DIMENSION / Math.max(image.naturalWidth, image.naturalHeight));
+    let width = Math.max(1, Math.round(image.naturalWidth * scale));
+    let height = Math.max(1, Math.round(image.naturalHeight * scale));
+    let output = "";
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("图片处理失败，请重试");
+      context.drawImage(image, 0, 0, width, height);
+      const quality = Math.max(0.52, UPLOAD_IMAGE_QUALITY - attempt * 0.08);
+      output = canvas.toDataURL("image/webp", quality);
+      const byteLength = Math.max(0, Math.ceil((output.length - output.indexOf(",") - 1) * 3 / 4));
+      if (byteLength <= UPLOAD_IMAGE_MAX_BYTES || attempt === 4) return output;
+      width = Math.max(1, Math.round(width * 0.82));
+      height = Math.max(1, Math.round(height * 0.82));
+    }
+    return output;
+  } finally {
+    URL.revokeObjectURL(sourceUrl);
+  }
+}
 
 function mergeProducts(current: Product[], incoming: Product[]) {
   return [
     ...current.filter((product) => !incoming.some((remote) => remote.id === product.id)),
     ...incoming.map((product) => ({
       ...product,
-      image: bundledCatalogImages[product.catalogId || ""] || product.image,
+      image: bundledCatalogImages[product.catalogId || ""] || bundledMediaImages[product.image] || product.image,
+      images: product.images?.map((image) => bundledMediaImages[image] || image),
     })),
   ];
 }
@@ -1256,12 +1329,12 @@ export function AuthScreen({
             {!(mode === "register" && role === "seller" && sellerStep === 2) && <button data-testid="auth-submit" className="primary full" type="submit" disabled={submitting}>
               {mode === "login" ? "登录" : role === "seller" ? "下一步" : "注册并进入手作集"}
             </button>}
-            {mode === "login" && <button data-testid="auth-forgot-password" className="auth-text-link" type="button" onClick={() => { setMode("forgot"); setError(""); }}>忘记密码？</button>}
             </>}
           </form>
-          <button className="auth-back" onClick={onBack}>
-            返回首页
-          </button>
+          <div className="auth-actions-row">
+            {mode === "login" && <button data-testid="auth-forgot-password" className="auth-text-link" type="button" onClick={() => { setMode("forgot"); setError(""); }}>忘记密码？</button>}
+            <button type="button" className="auth-back" onClick={onBack}>返回首页</button>
+          </div>
         </div>
       </section>
     </main>
@@ -1674,6 +1747,202 @@ function ProfileSettings({
       </form>
     </section>
   </main>;
+}
+
+const COMMUNITY_CATEGORIES = ["全部", "店铺经营", "商品拍摄", "定价与营销", "物流经验", "平台建议", "闲聊交流"];
+
+function CreatorCommunity() {
+  const [visitorId] = useState(() => {
+    const key = "creator-community-visitor-id";
+    const existing = window.localStorage.getItem(key);
+    if (existing) return existing;
+    const next = window.crypto?.randomUUID?.() || `visitor-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+    window.localStorage.setItem(key, next);
+    return next;
+  });
+  const [nickname, setNickname] = useState(() => window.localStorage.getItem("creator-community-nickname") || "");
+  const [nicknameDialogOpen, setNicknameDialogOpen] = useState(() => !window.localStorage.getItem("creator-community-nickname"));
+  const [posts, setPosts] = useState<CommunityPost[]>([]);
+  const [category, setCategory] = useState("全部");
+  const [postCategory, setPostCategory] = useState("店铺经营");
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [postImageUrls, setPostImageUrls] = useState<string[]>([]);
+  const [commentImageUrls, setCommentImageUrls] = useState<Record<string, string[]>>({});
+  const [expandedReplies, setExpandedReplies] = useState<Record<string, boolean>>({});
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
+  const [replyingTo, setReplyingTo] = useState<{ postId: string; commentId: string; nickname: string } | null>(null);
+  const commentInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const [notice, setNotice] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [posting, setPosting] = useState(false);
+  const [postDialogOpen, setPostDialogOpen] = useState(false);
+  const [reportTarget, setReportTarget] = useState<{ type: "post" | "comment"; id: string } | null>(null);
+  const [reportReason, setReportReason] = useState("广告或骚扰");
+  const [reporting, setReporting] = useState(false);
+
+  const flash = (message: string) => {
+    setNotice(message);
+    window.setTimeout(() => setNotice(""), 2400);
+  };
+  const loadPosts = async () => {
+    setLoading(true);
+    try {
+      const query = category === "全部" ? "" : `?category=${encodeURIComponent(category)}`;
+      const response = await fetch(`${API_BASE}/api/community/posts${query}`);
+      const payload = (await response.json()) as { posts?: CommunityPost[]; error?: string };
+      if (!response.ok) throw new Error(payload.error || "社区内容加载失败");
+      setPosts(payload.posts || []);
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "社区内容加载失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { void loadPosts(); }, [category]);
+  useEffect(() => {
+    if (!previewImageUrl) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setPreviewImageUrl(null); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [previewImageUrl]);
+  useEffect(() => {
+    let active = true;
+    let retryTimer: number | undefined;
+    let socket: WebSocket | undefined;
+    const connect = () => {
+      if (!active) return;
+      try {
+        socket = new WebSocket(communityWebsocketUrl(visitorId));
+        socket.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data) as { type?: string };
+            if (payload.type === "community_post_created" || payload.type === "community_comment_created") void loadPosts();
+          } catch { /* Ignore malformed broadcast frames. */ }
+        };
+        socket.onclose = () => {
+          if (active) retryTimer = window.setTimeout(connect, 3000);
+        };
+        socket.onerror = () => socket?.close();
+      } catch {
+        retryTimer = window.setTimeout(connect, 3000);
+      }
+    };
+    connect();
+    return () => {
+      active = false;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      socket?.close();
+    };
+  }, [visitorId, category]);
+  const identity = () => {
+    const value = nickname.trim();
+    if (value.length < 2 || value.length > 24) {
+      flash("请先填写 2 到 24 个字符的昵称");
+      return null;
+    }
+    window.localStorage.setItem("creator-community-nickname", value);
+    return value;
+  };
+  const saveNickname = (event: FormEvent) => {
+    event.preventDefault();
+    if (!identity()) return;
+    setNicknameDialogOpen(false);
+    flash("昵称已保存");
+  };
+  const uploadCommunityImage = async (file: File, onUploaded: (url: string) => void) => {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) return flash("图片仅支持 JPG、PNG 或 WebP 格式");
+    if (file.size > 10 * 1024 * 1024) return flash("图片不能超过 10MB");
+    setUploadingImage(true);
+    try {
+      const data = await compressImageForUpload(file);
+      const response = await fetch(`${API_BASE}/api/community/media`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ visitorId, data }) });
+      const payload = (await response.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (!response.ok || !payload.url) throw new Error(payload.error || "图片上传失败");
+      onUploaded(payload.url);
+    } catch (error) { flash(error instanceof Error ? error.message : "图片上传失败"); }
+    finally { setUploadingImage(false); }
+  };
+  const createPost = async (event: FormEvent) => {
+    event.preventDefault();
+    const name = identity();
+    if (!name || posting) return;
+    setPosting(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/community/posts`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visitorId, nickname: name, category: postCategory, title, content, attachmentUrls: postImageUrls }),
+      });
+      const payload = (await response.json()) as { post?: CommunityPost; error?: string };
+      if (!response.ok) throw new Error(payload.error || "发帖失败");
+      setTitle(""); setContent(""); setPostImageUrls([]); setPostDialogOpen(false); flash("帖子已发布");
+      await loadPosts();
+    } catch (error) { flash(error instanceof Error ? error.message : "发帖失败"); }
+    finally { setPosting(false); }
+  };
+  const addComment = async (postId: string) => {
+    const name = identity();
+    const draft = (commentDrafts[postId] || "").trim();
+    const attachmentUrls = commentImageUrls[postId] || [];
+    if (!name || (!draft && attachmentUrls.length === 0)) return;
+    const parentCommentId = replyingTo?.postId === postId ? replyingTo.commentId : undefined;
+    const response = await fetch(`${API_BASE}/api/community/posts/${encodeURIComponent(postId)}/comments`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ visitorId, nickname: name, content: draft, parentCommentId, attachmentUrls }),
+    });
+    const payload = (await response.json()) as { comment?: CommunityComment; error?: string };
+    if (!response.ok) { flash(payload.error || "评论失败"); return; }
+    setCommentDrafts((current) => ({ ...current, [postId]: "" }));
+    setCommentImageUrls((current) => ({ ...current, [postId]: [] }));
+    setReplyingTo((current) => current?.postId === postId ? null : current);
+    setPosts((current) => current.map((post) => post.id === postId && payload.comment ? { ...post, comments: [...post.comments, payload.comment] } : post));
+  };
+  const removeCommentImage = (postId: string, imageUrl: string) => {
+    setCommentImageUrls((current) => ({ ...current, [postId]: (current[postId] || []).filter((url) => url !== imageUrl) }));
+  };
+  const beginReply = (postId: string, comment: CommunityComment) => {
+    const prefix = `@${comment.nickname}：`;
+    setReplyingTo({ postId, commentId: comment.id, nickname: comment.nickname });
+    setCommentDrafts((current) => ({ ...current, [postId]: prefix }));
+    window.setTimeout(() => commentInputRefs.current[postId]?.focus(), 0);
+  };
+  const renderComments = (post: CommunityPost, parentCommentId: string | null = null, depth = 0) => {
+    const matchingComments = post.comments.filter((comment) => (comment.parentCommentId || null) === parentCommentId);
+    const visibleComments = parentCommentId === null && !expandedReplies[post.id] ? matchingComments.slice(0, 1) : matchingComments;
+    return visibleComments.map((comment) => {
+      const imageUrls = comment.imageUrls?.length ? comment.imageUrls : comment.imageUrl ? [comment.imageUrl] : [];
+      return <div className="community-comment-thread" key={comment.id} style={{ marginLeft: `${Math.min(depth, 3) * 18}px` }}><div className={`community-comment${depth ? " community-comment-reply" : ""}${imageUrls.length ? " community-comment-with-image" : ""}`}><b>{comment.nickname}</b><div className="community-comment-body"><div className="community-comment-message-row">{imageUrls.length > 0 && <div className="community-attachment-list">{imageUrls.map((url, index) => <button type="button" className="community-attachment-button" aria-label={`放大评论图片 ${index + 1}`} onClick={() => setPreviewImageUrl(url)} key={url}><img className="community-attachment community-comment-attachment" src={url} alt={`评论图片 ${index + 1}`} /></button>)}</div>}<span>{comment.content}</span><button type="button" className="community-comment-reply-link" onClick={() => beginReply(post.id, comment)}>回复</button><button type="button" className="community-report-link" onClick={() => setReportTarget({ type: "comment", id: comment.id })}>举报</button></div></div></div>{renderComments(post, comment.id, depth + 1)}</div>;
+    });
+  };
+  const PostDialog = () => !postDialogOpen ? null : <div className="community-post-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !posting) setPostDialogOpen(false); }}><section className="community-post-dialog" role="dialog" aria-modal="true" aria-labelledby="community-post-title"><header><div><p className="eyebrow">CREATOR COMMUNITY</p><h2 id="community-post-title">发布一个话题</h2></div><button type="button" className="community-dialog-close" disabled={posting} onClick={() => setPostDialogOpen(false)}>取消</button></header><p className="community-post-dialog-intro">无需注册，昵称只保存在当前浏览器。</p><form onSubmit={createPost}><div className="community-form-grid"><label>分类<select value={postCategory} onChange={(event) => setPostCategory(event.target.value)}>{COMMUNITY_CATEGORIES.slice(1).map((item) => <option key={item}>{item}</option>)}</select></label><label>标题<input value={title} maxLength={80} onChange={(event) => setTitle(event.target.value)} placeholder="想和其他创作者聊什么？" required /></label><label className="community-form-wide">正文<textarea value={content} maxLength={2000} onChange={(event) => setContent(event.target.value)} placeholder="分享你的经验或问题" required /></label></div><div className="community-post-image-control"><label className="community-image-upload"><ImagePlus size={17} /><span>{uploadingImage ? "上传中…" : "添加图片"}</span><input type="file" accept="image/jpeg,image/png,image/webp" multiple disabled={uploadingImage} onChange={(event) => { const files = Array.from(event.target.files || []); event.currentTarget.value = ""; files.slice(0, Math.max(0, 6 - postImageUrls.length)).forEach((file) => void uploadCommunityImage(file, (url) => setPostImageUrls((current) => current.includes(url) || current.length >= 6 ? current : [...current, url]))); }} /></label>{postImageUrls.length > 0 && <div className="community-post-image-preview">{postImageUrls.map((url, index) => <span key={url}><img src={url} alt={`待发布图片 ${index + 1}`} /></span>)}</div>}</div><div className="community-form-actions"><span>{notice}</span><button className="primary" disabled={posting || uploadingImage}>{posting ? "发布中…" : "发布话题"}</button></div></form></section></div>;
+  const CommunityImageLightbox = () => !previewImageUrl ? null : <div className="community-image-lightbox" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewImageUrl(null); }}><figure role="dialog" aria-modal="true" aria-label="图片预览"><img src={previewImageUrl} alt="社区图片预览" /><button type="button" aria-label="关闭图片预览" onClick={() => setPreviewImageUrl(null)}><X size={19} /></button></figure></div>;
+  const report = async (targetType: "post" | "comment", targetId: string, reason: string) => {
+    const name = identity();
+    if (!name) return false;
+    const response = await fetch(`${API_BASE}/api/community/reports`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ visitorId, nickname: name, targetType, targetId, reason }),
+    });
+    const payload = (await response.json()) as { error?: string };
+    flash(response.ok ? "举报已提交，感谢你的反馈" : payload.error || "举报失败");
+    return response.ok;
+  };
+  const submitReport = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!reportTarget || reporting) return;
+    setReporting(true);
+    const succeeded = await report(reportTarget.type, reportTarget.id, reportReason);
+    setReporting(false);
+    if (succeeded) {
+      setReportTarget(null);
+      setReportReason("广告或骚扰");
+    }
+  };
+  return <>{PostDialog()}<CommunityImageLightbox /><main className="community-page"><section className="container section">
+    <div className="community-hero"><div><p className="eyebrow">CREATOR COMMUNITY</p><h1>创作者社区</h1><p>分享创作手工作品的心得、灵感。</p></div><div className="community-current-nickname"><b>{nickname}</b><button type="button" onClick={() => setNicknameDialogOpen(true)}>修改</button></div></div>
+    <div className="community-toolbar"><div className="community-category-tabs">{COMMUNITY_CATEGORIES.map((item) => <button key={item} className={category === item ? "active" : ""} onClick={() => setCategory(item)}>{item}</button>)}</div><div className="community-toolbar-actions"><button className="secondary" onClick={() => void loadPosts()}>刷新</button><button className="primary" onClick={() => setPostDialogOpen(true)}>发布话题</button></div></div>
+    <div className="community-post-list">{loading ? <p className="community-empty">正在加载社区内容…</p> : posts.length === 0 ? <p className="community-empty">还没有话题，来发布第一篇吧。</p> : posts.map((post) => <article className="community-post" key={post.id}><header><div><div className="community-post-title-row"><span className="community-post-category">{post.category}</span><h2>{post.title}</h2></div><small><span className="community-author">{post.nickname}<i className="community-owner-badge">帖主</i></span> · {new Date(post.createdAt.replace(" ", "T") + "Z").toLocaleString()}</small></div><button className="community-report-link" onClick={() => setReportTarget({ type: "post", id: post.id })}>举报</button></header><p className="community-post-content">{post.content}</p>{(post.imageUrls?.length ? post.imageUrls : post.imageUrl ? [post.imageUrl] : []).map((url, index) => <button type="button" className="community-attachment-button community-post-attachment-button" aria-label={`放大帖子图片 ${index + 1}`} onClick={() => setPreviewImageUrl(url)} key={url}><img className="community-attachment community-post-attachment" src={url} alt={`帖子图片 ${index + 1}`} /></button>)}<div className="community-comment-list">{renderComments(post)}{post.comments.filter((comment) => !comment.parentCommentId).length > 1 && <button type="button" className="community-replies-toggle" onClick={() => setExpandedReplies((current) => ({ ...current, [post.id]: !current[post.id] }))}>{expandedReplies[post.id] ? "收起回复" : `展开其余 ${post.comments.filter((comment) => !comment.parentCommentId).length - 1} 条回复`}</button>}</div><form className="community-comment-form" onSubmit={(event) => { event.preventDefault(); void addComment(post.id); }}><div className="community-reply-context">{replyingTo?.postId === post.id && <><span>回复 @{replyingTo.nickname}</span><button type="button" onClick={() => { setReplyingTo(null); setCommentDrafts((current) => ({ ...current, [post.id]: "" })); }}>取消回复</button></>}</div><label className="community-comment-image-upload" title="添加图片"><ImagePlus size={16} /><input type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { const files = Array.from(event.target.files || []); event.currentTarget.value = ""; files.slice(0, Math.max(0, 6 - (commentImageUrls[post.id] || []).length)).forEach((file) => void uploadCommunityImage(file, (url) => setCommentImageUrls((current) => ({ ...current, [post.id]: (current[post.id] || []).includes(url) || (current[post.id] || []).length >= 6 ? (current[post.id] || []) : [...(current[post.id] || []), url] })))); }} /></label><div className="community-comment-composer">{(commentImageUrls[post.id] || []).length > 0 && <span className="community-image-ready"><b>{nickname}</b>{commentImageUrls[post.id].map((url, index) => <span className="community-image-thumb" key={url}><img src={url} alt={`待回复图片 ${index + 1}`} /><button type="button" aria-label={`删除待回复图片 ${index + 1}`} title="删除图片" onClick={() => removeCommentImage(post.id, url)}><X size={13} /></button></span>)}</span>}<input ref={(element) => { commentInputRefs.current[post.id] = element; }} value={commentDrafts[post.id] || ""} maxLength={500} onChange={(event) => setCommentDrafts((current) => ({ ...current, [post.id]: event.target.value }))} placeholder="写下你的回复…" /></div><button className="secondary" disabled={uploadingImage}>回复</button></form></article>)}</div>
+  </section></main>{nicknameDialogOpen && <div className="community-nickname-backdrop" role="presentation" onMouseDown={(event) => event.preventDefault()}><section className="community-nickname-dialog" role="dialog" aria-modal="true" aria-labelledby="community-nickname-title"><p className="eyebrow">WELCOME</p><h2 id="community-nickname-title">先设置一个社区昵称</h2><p>社区无需注册，取一个昵称和其他创作者交流起来吧。</p><form onSubmit={saveNickname}><label>昵称<input autoFocus value={nickname} maxLength={24} onChange={(event) => setNickname(event.target.value)} placeholder="例如：木棉手作" /></label><button className="primary">进入创作者社区</button></form></section></div>}{reportTarget && <div className="community-report-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setReportTarget(null); }}><section className="community-report-dialog" role="dialog" aria-modal="true" aria-labelledby="community-report-title"><header><div><p className="eyebrow">COMMUNITY SAFETY</p><h2 id="community-report-title">举报内容</h2></div></header><p className="community-report-intro">请选择举报原因，我们会尽快审核处理。</p><form onSubmit={submitReport}><label>举报原因<select value={reportReason} onChange={(event) => setReportReason(event.target.value)}><option>广告或骚扰</option><option>不当或违规内容</option><option>侵权或抄袭</option><option>其他</option></select></label><div className="community-report-notice">举报内容会提交给平台审核，请勿重复提交。</div><footer><button type="button" className="secondary" onClick={() => setReportTarget(null)}>取消</button><button className="primary" disabled={reporting}>{reporting ? "提交中…" : "提交举报"}</button></footer></form></section></div>}</>;
 }
 
 function Marketplace({
@@ -2326,11 +2595,13 @@ function Marketplace({
             <>
               {nav("home", "首页")}
               {nav("discover", "发现好物")}
+              {nav("community", "创作者社区")}
             </>
           ) : (
             <>
               {nav("studio", "店主工作台")}
               {nav("shop", "店铺主页")}
+              {nav("community", "创作者社区")}
             </>
           )}
         </nav>
@@ -2349,6 +2620,7 @@ function Marketplace({
             }}
           />
         )}
+        {view === "community" && <CreatorCommunity />}
         {view === "discover" && (
           <Discover
             products={searchResults ?? data.products.filter((product) => product.listed !== false)}
@@ -2369,9 +2641,12 @@ function Marketplace({
         {view === "product" && (
           <ProductDetail
             product={selected}
+            products={data.products}
             favorite={data.favorites.includes(selected.id)}
             onBack={() => show(productReturnView)}
             onFavorite={toggleFavorite}
+            favorites={data.favorites}
+            onOpen={openProduct}
             shopFollowed={data.followedShops.some(
               (shop) => String(shop.id) === String(selected.analyticsShopId),
             )}
@@ -2845,7 +3120,7 @@ function ProductGrid({
       {products.map((p) => (
         <article className="product-card" data-testid={`product-card-${p.catalogId || p.id}`} key={p.id}>
           <div className="product-image" onClick={() => onOpen(p.id)}>
-            <img src={p.image} alt={p.title} />
+            <img src={bundledCatalogImages[p.catalogId || ""] || bundledMediaImages[p.image] || p.image} alt={p.title} />
             {p.custom && <span className="custom-badge">可定制</span>}
             <IconButton
               icon={Heart}
@@ -2857,8 +3132,8 @@ function ProductGrid({
               }}
             />
           </div>
-          <button data-testid={`product-open-${p.catalogId || p.id}`} className="product-info" onClick={() => onOpen(p.id)}>
-            <h3>{p.title}</h3>
+          <div className="product-info">
+            <h3><button data-testid={`product-open-${p.catalogId || p.id}`} className="product-title-link" onClick={() => onOpen(p.id)}>{p.title}</button></h3>
             <p>{p.shop}</p>
             <span className="rating">
               <Star size={14} fill="currentColor" />
@@ -2866,7 +3141,7 @@ function ProductGrid({
             </span>
             <strong>{money(p.price)}</strong>
             {p.oldPrice && <del>{money(p.oldPrice)}</del>}
-          </button>
+          </div>
         </article>
       ))}
     </div>
@@ -2875,9 +3150,12 @@ function ProductGrid({
 
 function ProductDetail({
   product,
+  products,
   favorite,
   onBack,
   onFavorite,
+  favorites,
+  onOpen,
   shopFollowed,
   onToggleShopFollow,
   onAdd,
@@ -2886,9 +3164,12 @@ function ProductDetail({
   onReport,
 }: {
   product: Product;
+  products: Product[];
   favorite: boolean;
   onBack: () => void;
   onFavorite: (id: number) => void;
+  favorites: number[];
+  onOpen: (id: number) => void;
   shopFollowed: boolean;
   onToggleShopFollow: () => void;
   onAdd: (q: number, variants: Record<string, string>) => void;
@@ -2897,23 +3178,21 @@ function ProductDetail({
   onReport: (reason: string, detail: string, evidence: string[]) => Promise<boolean>;
 }) {
   const [quantity, setQuantity] = useState(1);
-  const [note, setNote] = useState("");
   const [showReport, setShowReport] = useState(false);
   const [reportReason, setReportReason] = useState("涉嫌违法违规");
   const [reportDetail, setReportDetail] = useState("");
   const [reportEvidence, setReportEvidence] = useState<string[]>([]);
-  const addReportEvidence = (file?: File) => {
+  const addReportEvidence = async (file?: File) => {
     if (!file || reportEvidence.length >= 6) return;
-    const reader = new FileReader();
-    reader.onload = async () => {
+    try {
+      const data = await compressImageForUpload(file);
       const response = await fetch(`${API_BASE}/api/media`, {
         method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data: String(reader.result), mediaType: "image" }),
+        body: JSON.stringify({ data, mediaType: "image" }),
       });
       const payload = (await response.json()) as { url?: string };
       if (response.ok && payload.url) setReportEvidence((items) => [...items, payload.url!]);
-    };
-    reader.readAsDataURL(file);
+    } catch { /* Ignore invalid evidence uploads. */ }
   };
   const [productReviews, setProductReviews] = useState<ProductReview[]>([]);
   const gallery = product.images?.length ? product.images : [product.image];
@@ -2971,6 +3250,20 @@ function ProductDetail({
     ? productReviews.reduce((total, review) => total + review.rating, 0) / productReviews.length
     : product.rating;
   const reviewCount = productReviews.length || product.reviews;
+  const relatedProducts = [
+    ...products.filter(
+      (item) =>
+        item.id !== product.id &&
+        item.category === product.category &&
+        item.listed !== false,
+    ),
+    ...products.filter(
+      (item) =>
+        item.id !== product.id &&
+        item.category !== product.category &&
+        item.listed !== false,
+    ),
+  ].slice(0, 4);
   const isVariantValueAvailable = (name: string, value: string) => {
     if (!product.skus?.length) return true;
     const nextSelection = { ...selectedVariants, [name]: value };
@@ -3021,9 +3314,6 @@ function ProductDetail({
           )}
         </div>
         <div className="detail-info">
-          <p className="eyebrow">
-            {product.category} · {product.shop}
-          </p>
           <h1>{product.title}</h1>
           <div className="detail-rating">
             <Star size={17} fill="currentColor" />
@@ -3066,19 +3356,6 @@ function ProductDetail({
               </div>
             </div>
           ))}
-          {product.custom && (
-            <>
-              <label className="label" htmlFor="note">
-                定制说明（可选）
-              </label>
-              <textarea
-                id="note"
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                placeholder="例如：刻字内容、希望的颜色..."
-              />
-            </>
-          )}
           <div className="quantity-row">
             <span>数量</span>
             <div>
@@ -3122,16 +3399,25 @@ function ProductDetail({
               onClick={() => onFavorite(product.id)}
             />
           </div>
+          {product.custom && (
+            <p className="product-custom-notice">
+              支持定制，请先咨询店主确认方案、价格和交付时间。
+            </p>
+          )}
           <div className="shop-mini">
             <Store size={22} />
             <div>
               <strong>{product.shop}</strong>
               <span>独立创作者 · 已售 300+ 件</span>
             </div>
-            <button className="text-link" onClick={onToggleShopFollow}>
-              {shopFollowed ? "已关注" : "关注店铺"}
-            </button>
-            <button className="text-link" onClick={onContact}>咨询店主</button>
+            <div className="shop-mini-actions">
+              <button className="shop-action-link" type="button" onClick={onToggleShopFollow}>
+                {shopFollowed ? "已关注" : "关注店铺"}
+              </button>
+              <button className="shop-action-link" type="button" onClick={onContact}>
+                咨询店主
+              </button>
+            </div>
           </div>
           <div className="content-report">
             <button className="text-link" type="button" onClick={() => setShowReport((value) => !value)}>
@@ -3205,6 +3491,21 @@ function ProductDetail({
           <p className="product-review-empty">暂无真实评价</p>
         )}
       </section>
+      <section className="related-products">
+        <div className="section-heading">
+          <h2>同类作品</h2>
+        </div>
+        {relatedProducts.length ? (
+          <ProductGrid
+            products={relatedProducts}
+            favorites={favorites}
+            onOpen={onOpen}
+            onFavorite={onFavorite}
+          />
+        ) : (
+          <p className="product-review-empty">暂无同类作品</p>
+        )}
+      </section>
     </div>
   );
 }
@@ -3232,9 +3533,19 @@ function Messages({ role, embedded = false, onUnreadChange }: { role: "buyer" | 
   const [search, setSearch] = useState("");
   const [selectedOrderId, setSelectedOrderId] = useState("");
   const [newReply, setNewReply] = useState("");
-  const [replyCategory, setReplyCategory] = useState("general");
+  const replyCategory = "general";
+  const [selectedQuickReplyId, setSelectedQuickReplyId] = useState("");
+  const quickReplyCategories = [{ value: "general", label: "通用" }, { value: "shipping", label: "物流" }, { value: "after_sale", label: "售后" }, { value: "orders", label: "订单" }, { value: "payment", label: "付款" }];
+  const quickReplyCategoryLabel = (value: string) => quickReplyCategories.find((item) => item.value === value)?.label || value;
   const [notice, setNotice] = useState("");
+  const [supportOpen, setSupportOpen] = useState(false);
+  const [supportSubject, setSupportSubject] = useState("");
+  const [supportContent, setSupportContent] = useState("");
+  const [supportPriority, setSupportPriority] = useState("normal");
+  const [supportTickets, setSupportTickets] = useState<{ id: string; subject: string; status: string; priority: string; createdAt: string; updatedAt: string }[]>([]);
+  const [supportNotice, setSupportNotice] = useState("");
   const messageCursor = useRef(0);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
 
   const endpoint = role === "buyer" ? "/api/messages/buyer" : "/api/messages/seller";
   const conversationKey = (item: Conversation) => `${item.shopId}:${item.buyerUserId || "buyer"}`;
@@ -3296,6 +3607,12 @@ function Messages({ role, embedded = false, onUnreadChange }: { role: "buyer" | 
   }, [selectedKey, conversations]);
 
   useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    window.requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; });
+  }, [messages.length, selectedKey]);
+
+  useEffect(() => {
     if (!selected) return;
     const params = new URLSearchParams({ shopId: selected.shopId, after: String(messageCursor.current) });
     if (role === "seller" && selected.buyerUserId) params.set("buyerUserId", selected.buyerUserId);
@@ -3337,12 +3654,7 @@ function Messages({ role, embedded = false, onUnreadChange }: { role: "buyer" | 
   };
 
   const uploadImage = async (file: File) => {
-    const data = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = () => reject(new Error("图片读取失败"));
-      reader.readAsDataURL(file);
-    });
+    const data = await compressImageForUpload(file);
     const response = await fetch(`${API_BASE}/api/media`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ data, mediaType: "image" }) });
     const payload = await response.json().catch(() => ({})) as { url?: string; error?: string };
     if (!response.ok || !payload.url) throw new Error(payload.error || "图片上传失败");
@@ -3351,9 +3663,29 @@ function Messages({ role, embedded = false, onUnreadChange }: { role: "buyer" | 
 
   const matchingOrders = orders.filter((order) => !!selected && String(order.shopId) === String(selected.shopId) && (role === "buyer" || order.buyerUserId === selected.buyerUserId));
   const visibleConversations = conversations.filter((item) => `${item.shop} ${item.buyer || ""} ${item.preview}`.toLowerCase().includes(search.trim().toLowerCase()));
+  const loadSupportTickets = async () => {
+    const response = await fetch(`${API_BASE}/api/support/tickets`, { credentials: "include" });
+    const payload = await response.json().catch(() => ({})) as { tickets?: typeof supportTickets; error?: string };
+    if (!response.ok) return setSupportNotice(payload.error || "平台工单加载失败");
+    setSupportTickets(payload.tickets || []);
+  };
+  const submitSupportTicket = async (event: FormEvent) => {
+    event.preventDefault();
+    const subject = supportSubject.trim();
+    const content = supportContent.trim();
+    if (!subject || !content) return setSupportNotice("请填写问题主题和详细描述");
+    const response = await fetch(`${API_BASE}/api/support/tickets`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ subject, content, priority: supportPriority }) });
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    if (!response.ok) return setSupportNotice(payload.error || "平台工单提交失败");
+    setSupportSubject("");
+    setSupportContent("");
+    setSupportPriority("normal");
+    setSupportNotice("工单已提交，平台客服会尽快处理");
+    void loadSupportTickets();
+  };
   const shellClass = embedded ? "conversation-center conversation-embedded" : "container page section conversation-center";
   return <div className={shellClass}>
-    {!embedded && <div className="page-title"><div><h1>消息</h1><p>查看会话、订单咨询与服务回复</p></div></div>}
+    {!embedded && <div className="page-title"><div><h1>消息</h1><p>查看会话、订单咨询与服务回复</p></div>{role === "buyer" && <button className="primary" type="button" onClick={() => { setSupportOpen(true); setSupportNotice(""); void loadSupportTickets(); }}>联系客服</button>}</div>}
     {notice && <p className="auth-error">{notice}</p>}
     <section className="conversation-layout">
       <aside className="conversation-sidebar">
@@ -3366,19 +3698,20 @@ function Messages({ role, embedded = false, onUnreadChange }: { role: "buyer" | 
       <div className="conversation-detail">
         {selected ? <>
           <header><div><b>{role === "seller" ? selected.buyer || "买家" : selected.shop}</b><small>{role === "seller" ? selected.shop : "店铺会话"}</small></div></header>
-          <div className="conversation-messages">
+          <div className="conversation-messages" ref={messagesContainerRef}>
             {messages.map((message) => <article className={(role === "buyer" ? message.sender === "buyer" : message.sender === "seller") ? "outgoing" : "incoming"} key={message.id}>
-              {message.type === "image" ? <img src={message.attachmentUrl} alt="聊天图片" /> : message.type === "order" && message.order ? <div className="message-order-card">{message.order.image && <img src={message.order.image} alt="订单作品" />}<span><b>{message.order.title}</b><small>订单 {message.order.orderNo || message.order.id} · {message.order.status}</small><strong>￥{message.order.amount?.toFixed(2)}</strong></span></div> : <p>{message.content}</p>}
               <small>{message.createdAt}</small>
+              {message.type === "image" ? <img src={message.attachmentUrl} alt="聊天图片" /> : message.type === "order" && message.order ? <div className="message-order-card">{message.order.image && <img src={message.order.image} alt="订单作品" />}<span><b>{message.order.title}</b><small>订单 {message.order.orderNo || message.order.id} · {message.order.status}</small><strong>￥{message.order.amount?.toFixed(2)}</strong></span></div> : <p>{message.content}</p>}
             </article>)}
             {!messages.length && <p className="conversation-empty">选择会话后查看沟通记录</p>}
           </div>
-          {role === "seller" && <div className="quick-replies"><div>{quickReplies.map((reply) => <span key={reply.id}><button type="button" onClick={() => setContent(reply.content)}>{reply.category} · {reply.content}</button><button type="button" className="remove" title="删除快捷回复" onClick={async () => { const response = await fetch(`${API_BASE}/api/messages/quick-replies/${encodeURIComponent(reply.id)}`, { method: "DELETE", credentials: "include" }); if (!response.ok) return setNotice("删除快捷回复失败"); setQuickReplies((items) => items.filter((item) => item.id !== reply.id)); }}>×</button></span>)}</div><form onSubmit={async (event) => { event.preventDefault(); if (!newReply.trim()) return; const response = await fetch(`${API_BASE}/api/messages/quick-replies`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: newReply.trim(), category: replyCategory }) }); const payload = await response.json().catch(() => ({})) as { quickReply?: { id: string; content: string; category: string }; error?: string }; if (!response.ok || !payload.quickReply) return setNotice(payload.error || "快捷回复保存失败"); setQuickReplies((items) => [payload.quickReply!, ...items]); setNewReply(""); }}><input value={newReply} onChange={(event) => setNewReply(event.target.value)} maxLength={500} placeholder="新增快捷回复" /><input value={replyCategory} onChange={(event) => setReplyCategory(event.target.value)} maxLength={30} placeholder="分类" /><button className="secondary">保存</button></form></div>}
-          <div className="conversation-tools"><label className="icon-upload" title="发送图片"><ImagePlus size={18} /><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void uploadImage(file).catch((error: Error) => setNotice(error.message)); }} /></label><select value={selectedOrderId} onChange={(event) => setSelectedOrderId(event.target.value)}><option value="">发送订单卡片</option>{matchingOrders.map((order) => <option value={order.orderId || order.id} key={order.orderId || order.id}>订单 {order.id} · ￥{order.amount.toFixed(2)}</option>)}</select><button className="secondary" type="button" disabled={!selectedOrderId} onClick={() => void sendMessage({ type: "order", orderId: selectedOrderId })}>发送订单</button></div>
+          {role === "seller" && <div className="quick-replies"><div className="quick-reply-controls"><select className="quick-reply-picker" value={selectedQuickReplyId} onChange={(event) => { const id = event.target.value; setSelectedQuickReplyId(id); const reply = quickReplies.find((item) => item.id === id); if (reply) setContent(reply.content); }}><option value="">选择快捷回复</option>{quickReplies.map((reply) => <option key={reply.id} value={reply.id}>{quickReplyCategoryLabel(reply.category)} · {reply.content}</option>)}</select><form onSubmit={async (event) => { event.preventDefault(); if (!newReply.trim()) return; const response = await fetch(`${API_BASE}/api/messages/quick-replies`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: newReply.trim(), category: replyCategory }) }); const payload = await response.json().catch(() => ({})) as { quickReply?: { id: string; content: string; category: string }; error?: string }; if (!response.ok || !payload.quickReply) return setNotice(payload.error || "快捷回复保存失败"); setQuickReplies((items) => [payload.quickReply!, ...items]); setSelectedQuickReplyId(payload.quickReply!.id); setContent(payload.quickReply!.content); setNewReply(""); }}><input value={newReply} onChange={(event) => setNewReply(event.target.value)} maxLength={500} placeholder="新增快捷回复" /><button className="secondary">保存</button></form></div></div>}
+          <div className="conversation-tools"><label className="icon-upload conversation-image-upload" title="发送图片"><ImagePlus size={17} /><span>发送图片</span><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void uploadImage(file).catch((error: Error) => setNotice(error.message)); }} /></label><select value={selectedOrderId} onChange={(event) => setSelectedOrderId(event.target.value)}><option value="">发送订单卡片</option>{matchingOrders.map((order) => <option value={order.orderId || order.id} key={order.orderId || order.id}>订单 {order.id} · ￥{order.amount.toFixed(2)}</option>)}</select><button className="secondary" type="button" disabled={!selectedOrderId} onClick={() => void sendMessage({ type: "order", orderId: selectedOrderId })}>发送订单</button></div>
           <form className="conversation-composer" onSubmit={(event) => { event.preventDefault(); if (content.trim()) void sendMessage({ type: "text", content: content.trim() }); }}><input value={content} onChange={(event) => setContent(event.target.value)} maxLength={500} placeholder="输入消息" /><button className="primary">发送</button></form>
         </> : <div className="conversation-empty">暂时没有会话。请从作品或订单中联系店铺。</div>}
       </div>
     </section>
+    {supportOpen && <div className="support-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSupportOpen(false); }}><section className="support-dialog" role="dialog" aria-modal="true" aria-labelledby="support-dialog-title"><header><div><p className="eyebrow">PLATFORM SUPPORT</p><h2 id="support-dialog-title">联系客服</h2></div><button type="button" className="community-dialog-close" onClick={() => setSupportOpen(false)}>关闭</button></header><p className="support-dialog-intro">遇到平台、订单或账户问题，可以提交工单联系我们。</p>{supportNotice && <p className="support-dialog-notice">{supportNotice}</p>}<form onSubmit={submitSupportTicket}><label>问题主题<input value={supportSubject} maxLength={120} onChange={(event) => setSupportSubject(event.target.value)} placeholder="例如：订单支付遇到问题" /></label><label>问题描述<textarea value={supportContent} maxLength={1000} onChange={(event) => setSupportContent(event.target.value)} placeholder="请详细描述你遇到的问题" /></label><label>优先级<select value={supportPriority} onChange={(event) => setSupportPriority(event.target.value)}><option value="low">低</option><option value="normal">普通</option><option value="high">高</option><option value="urgent">紧急</option></select></label><footer><button type="button" className="secondary" onClick={() => setSupportOpen(false)}>取消</button><button className="primary">提交工单</button></footer></form><div className="support-ticket-history"><h3>我的工单</h3>{supportTickets.length ? supportTickets.slice(0, 8).map((ticket) => <div key={ticket.id}><span><b>{ticket.subject}</b><small>{ticket.createdAt}</small></span><em>{ticket.status}</em></div>) : <p>暂无历史工单</p>}</div></section></div>}
   </div>;
 }
 
@@ -3990,15 +4323,7 @@ export function AfterSaleForm({
     }
     try {
       const images = await Promise.all(
-        selected.map(
-          (file) =>
-            new Promise<string>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(String(reader.result));
-              reader.onerror = () => reject(new Error("无法读取图片"));
-              reader.readAsDataURL(file);
-            }),
-        ),
+        selected.map((file) => compressImageForUpload(file)),
       );
       setEvidence((items) => [...items, ...images]);
       setError(imageFiles.length > selected.length ? "最多上传 6 张凭证图片" : "");
@@ -4242,15 +4567,7 @@ export function ReviewForm({
     }
     try {
       const nextImages = await Promise.all(
-        filesToRead.map(
-          (file) =>
-            new Promise<string>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(String(reader.result));
-              reader.onerror = () => reject(new Error("无法读取图片"));
-              reader.readAsDataURL(file);
-            }),
-        ),
+        filesToRead.map((file) => compressImageForUpload(file)),
       );
       setImages((value) => [...value, ...nextImages]);
       setError(selectedFiles.length > filesToRead.length ? "最多上传 6 张评价图片" : "");
@@ -4701,9 +5018,24 @@ function Studio({
   onReplyReview: (id: string | number, reply: string) => Promise<boolean>;
   toast: (s: string) => void;
 }) {
+  const studioTabs = [
+    "overview",
+    "products",
+    "inventory",
+    "orders",
+    "messages",
+    "reviews",
+    "shipping",
+    "service",
+    "promotions",
+    "finance",
+    "settings",
+  ] as const;
+  type StudioTab = (typeof studioTabs)[number];
+  const initialStudioTab = new URLSearchParams(window.location.search).get("tab");
   const [tab, setTab] = useState<
-    "overview" | "products" | "inventory" | "orders" | "messages" | "reviews" | "shipping" | "service" | "promotions" | "finance" | "settings"
-  >("overview");
+    StudioTab
+  >(() => studioTabs.includes(initialStudioTab as StudioTab) ? initialStudioTab as StudioTab : "overview");
   const [messageUnread, setMessageUnread] = useState(0);
   const [showForm, setShowForm] = useState(false);
   const [shipmentOrder, setShipmentOrder] = useState<Order | null>(null);
@@ -4737,6 +5069,23 @@ function Studio({
   const [inventoryRowValues, setInventoryRowValues] = useState<Record<string, string>>({});
   const [inventoryListReason, setInventoryListReason] = useState("");
   const [inventoryAdjustments, setInventoryAdjustments] = useState<InventoryAdjustment[]>([]);
+  const openStudioTab = (next: StudioTab) => {
+    setTab(next);
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "studio");
+    url.searchParams.set("tab", next);
+    const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+    if (nextUrl !== `${window.location.pathname}${window.location.search}${window.location.hash}`)
+      window.history.pushState({ view: "studio", tab: next }, "", nextUrl);
+  };
+  useEffect(() => {
+    const syncTabFromLocation = () => {
+      const next = new URLSearchParams(window.location.search).get("tab");
+      setTab(studioTabs.includes(next as StudioTab) ? next as StudioTab : "overview");
+    };
+    window.addEventListener("popstate", syncTabFromLocation);
+    return () => window.removeEventListener("popstate", syncTabFromLocation);
+  }, []);
   const [form, setForm] = useState({
     title: "",
     price: "",
@@ -4747,6 +5096,7 @@ function Studio({
     images: [] as string[],
     video: "",
     seoTags: [] as string[],
+    custom: false,
   });
   const [seoTagInput, setSeoTagInput] = useState("");
   const [draggedImageIndex, setDraggedImageIndex] = useState<number | null>(
@@ -4922,6 +5272,60 @@ function Studio({
     setData((current) => ({ ...current, products: current.products.map((product) => product.catalogId === payload.product!.catalogId ? payload.product! : product) }));
     toast(status === "active" ? "SKU 已启用" : "SKU 已停用");
   };
+  const saveInventoryRow = async (product: Product, sku: ProductSku) => {
+    const nextValue = inventoryRowValues[sku.id];
+    if (nextValue === undefined) return;
+    if (nextValue.trim() === "" || Number(nextValue) === sku.stock) {
+      setInventoryRowValues((current) => {
+        const next = { ...current };
+        delete next[sku.id];
+        return next;
+      });
+      return;
+    }
+    const quantity = Number(nextValue);
+    if (!Number.isInteger(quantity) || quantity < 0) {
+      toast("库存必须是非负整数");
+      return;
+    }
+    if (!product.catalogId) return toast("作品尚未同步完成，无法保存库存");
+    const response = await fetch(`${API_BASE}/api/seller/inventory/adjustments`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        productId: product.catalogId,
+        skuId: sku.id,
+        type: "set",
+        quantity,
+        reason: "直接修改库存",
+      }),
+    });
+    const payload = (await response.json().catch(() => ({}))) as { product?: Product; error?: string };
+    if (!response.ok || !payload.product) return toast(payload.error || "库存自动保存失败");
+    setData((current) => ({
+      ...current,
+      products: current.products.map((item) =>
+        item.catalogId === payload.product!.catalogId ? payload.product! : item,
+      ),
+    }));
+    setInventoryRowValues((current) => {
+      const next = { ...current };
+      delete next[sku.id];
+      return next;
+    });
+    if (inventoryProduct?.catalogId === product.catalogId) {
+      const history = await fetch(
+        `${API_BASE}/api/seller/inventory/adjustments?productId=${encodeURIComponent(product.catalogId)}`,
+        { credentials: "include" },
+      );
+      if (history.ok)
+        setInventoryAdjustments(
+          ((await history.json()) as { adjustments: InventoryAdjustment[] }).adjustments,
+        );
+    }
+    toast("库存已自动保存");
+  };
   const saveInventoryList = async () => {
     const selectedRows = inventoryListRows.filter(({ sku }) => inventorySelectedSkuIds.includes(sku.id));
     if (!selectedRows.length) return toast("请先勾选需要修改的 SKU");
@@ -4975,7 +5379,7 @@ function Studio({
     if (!response.ok || !payload.url) throw new Error(payload.error || "媒体上传失败");
     return payload.url.startsWith("/") ? `${API_BASE}${payload.url}` : payload.url;
   };
-  const normalizeImage = (file: File) =>
+  const normalizeImageLegacy = (file: File) =>
     new Promise<string>((resolve, reject) => {
       if (!file.type.startsWith("image/"))
         return reject(new Error("请选择图片文件"));
@@ -5006,6 +5410,10 @@ function Studio({
       reader.onerror = () => reject(new Error("无法读取该图片"));
       reader.readAsDataURL(file);
     });
+  const normalizeImage = async (file: File) => {
+    try { return await compressImageForUpload(file); }
+    catch { return normalizeImageLegacy(file); }
+  };
   const validateProductImage = (file: File) => {
     if (!PRODUCT_IMAGE_TYPES.has(file.type))
       return "图片仅支持 JPG、PNG 或 WebP 格式";
@@ -5105,6 +5513,7 @@ function Studio({
       images: [],
       video: "",
       seoTags: [],
+      custom: false,
     });
     setSeoTagInput("");
     setVariantDrafts([]);
@@ -5146,7 +5555,7 @@ function Studio({
   const loadProductForm = (
     item: Pick<
       ProductDraft,
-      "title" | "price" | "category" | "stock" | "lowStockThreshold" | "description" | "images" | "video" | "seoTags" | "variants" | "skus"
+      "title" | "price" | "category" | "stock" | "lowStockThreshold" | "description" | "images" | "video" | "seoTags" | "custom" | "variants" | "skus"
     >,
   ) => {
     setForm({
@@ -5159,6 +5568,7 @@ function Studio({
       images: item.images,
       video: item.video,
       seoTags: item.seoTags || [],
+      custom: item.custom,
     });
     setSeoTagInput("");
     setVariantDrafts(
@@ -5198,6 +5608,7 @@ function Studio({
       images: form.images,
       video: form.video,
       seoTags: form.seoTags,
+      custom: form.custom,
       variants: collectVariants(),
       skus: collectVariants().length
         ? variantStockCombinations.map((optionValues) => ({
@@ -5248,6 +5659,7 @@ function Studio({
       images: product.images || [product.image],
       video: product.video || "",
       seoTags: product.seoTags || [],
+      custom: product.custom,
       variants: product.variants || [],
       skus: product.skus || [],
     });
@@ -5317,7 +5729,7 @@ function Studio({
       seoTags: form.seoTags,
       publishStatus: "published",
       reviewStatus: "approved",
-      custom: true,
+      custom: form.custom,
       description: form.description,
       material: "手工制作",
       variants: variants.length ? variants : undefined,
@@ -5459,7 +5871,7 @@ function Studio({
             key={id}
             data-testid={`seller-tab-${id}`}
             className={tab === id ? "active" : ""}
-            onClick={() => setTab(id)}
+            onClick={() => openStudioTab(id)}
           >
             {id === "overview" ? (
               <Settings2 size={18} />
@@ -5500,7 +5912,7 @@ function Studio({
               <button
                 className="primary"
                 onClick={() => {
-                  setTab("products");
+                  openStudioTab("products");
                   setShowForm(true);
                 }}
               >
@@ -5541,7 +5953,7 @@ function Studio({
               <section className="studio-panel dashboard-panel">
                 <div className="panel-head">
                   <h3>热销作品</h3>
-                  <button className="text-link" onClick={() => setTab("products")}>
+                  <button className="text-link" onClick={() => openStudioTab("products")}>
                     管理作品
                   </button>
                 </div>
@@ -5565,7 +5977,7 @@ function Studio({
               <section className="studio-panel dashboard-panel dashboard-fulfillment">
                 <div className="panel-head">
                   <h3>待发货</h3>
-                  <button className="text-link" onClick={() => setTab("orders")}>
+                  <button className="text-link" onClick={() => openStudioTab("orders")}>
                     查看订单
                   </button>
                 </div>
@@ -5579,7 +5991,7 @@ function Studio({
               <section className="studio-panel dashboard-panel">
                 <div className="panel-head">
                   <h3>库存预警</h3>
-                  <button className="text-link" onClick={() => setTab("products")}>
+                  <button className="text-link" onClick={() => openStudioTab("products")}>
                     调整库存
                   </button>
                 </div>
@@ -5619,7 +6031,7 @@ function Studio({
                     }
                   }}
                 >
-                  {showForm ? <X size={18} /> : <Plus size={18} />}
+                  {!showForm && <Plus size={18} />}
                   {showForm ? "取消编辑" : "发布作品"}
                 </button>
               </div>
@@ -5705,6 +6117,19 @@ function Studio({
                     </select>
                   </label>
                 </div>
+                <label className="product-custom-toggle">
+                  <input
+                    type="checkbox"
+                    checked={form.custom}
+                    onChange={(event) =>
+                      setForm({ ...form, custom: event.target.checked })
+                    }
+                  />
+                  <span>
+                    <b>支持定制</b>
+                    <small>买家需先咨询确认方案与报价</small>
+                  </span>
+                </label>
                 <div className="upload-grid">
                   {form.video ? (
                     <div className="upload-preview video-preview">
@@ -6112,7 +6537,16 @@ function Studio({
                           <img src={p.image} alt="" />
                         </button>
                         <div className="product-preview-info">
-                          <button className="product-title-link" onClick={() => onOpen(p.id)}>{p.title}</button>
+                          <a
+                            className="product-title-link"
+                            href={`#product-${p.catalogId || p.id}`}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              onOpen(p.id);
+                            }}
+                          >
+                            {p.title}
+                          </a>
                           <small>
                             {productListMode === "trash" ? "已下架" : "已发布"}
                             {productListMode === "listed" && ` · ${p.reviewStatus === "approved" ? "自动审核通过" : p.reviewStatus === "rejected" ? "审核未通过" : "审核中"}`}
@@ -6212,7 +6646,7 @@ function Studio({
         {tab === "inventory" && (
           <>
             <div className="studio-title"><div><h1>库存管理</h1><p>按 SKU 调整可售库存，并保留每一次变更记录</p></div><button className="secondary" onClick={exportInventory}>导出库存</button></div>
-            {inventoryProduct ? <><section className="studio-panel inventory-list-panel"><div className="panel-head"><div><h3>SKU 库存列表</h3><p>勾选 SKU 后可直接录入盘点库存并批量保存。</p></div><span>{inventoryListRows.length} 个 SKU</span></div><div className="inventory-list-toolbar"><label className="inventory-list-search"><Search size={16} /><input value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} placeholder="搜索作品、SKU 或规格" /></label><input value={inventoryListReason} maxLength={120} onChange={(event) => setInventoryListReason(event.target.value)} placeholder="批量盘点原因（必填）" /><button className="secondary" disabled={!inventorySelectedSkuIds.length} onClick={() => void saveInventoryList()}>保存已选 {inventorySelectedSkuIds.length || ""}</button></div><div className="inventory-list-head"><label><input type="checkbox" checked={allVisibleInventorySelected} onChange={() => setInventorySelectedSkuIds((current) => allVisibleInventorySelected ? current.filter((id) => !inventoryListRows.some(({ sku }) => sku.id === id)) : Array.from(new Set([...current, ...inventoryListRows.map(({ sku }) => sku.id)])))} />全选</label><span>作品</span><span>规格 / SKU</span><span>售价</span><span>库存</span><span>状态</span><span>操作</span></div><div className="inventory-list">{inventoryListRows.map(({ product, sku }) => { const spec = Object.keys(sku.optionValues).length ? Object.entries(sku.optionValues).map(([name, value]) => `${name}: ${value}`).join(" · ") : "默认规格"; const isLowStock = sku.stock > 0 && sku.stock < 10; const inventoryStatus = sku.stock === 0 ? "售罄" : sku.stock < 10 ? "紧张" : "可售"; return <article key={sku.id} className={`${inventorySku?.id === sku.id ? "selected" : ""} ${isLowStock ? "low-stock" : ""}`}><label className="inventory-row-check"><input type="checkbox" checked={inventorySelectedSkuIds.includes(sku.id)} onChange={() => setInventorySelectedSkuIds((current) => current.includes(sku.id) ? current.filter((id) => id !== sku.id) : [...current, sku.id])} /><span className="sr-only">选择 {product.title}</span></label><button type="button" className="inventory-row-product" onClick={() => selectInventorySku(product, sku)}><img src={product.image} alt="" /><span><b>{product.title}</b><small>ID：{product.catalogId || product.id}</small></span></button><span className="inventory-row-sku"><b>{spec}</b><small>{sku.code || "未编码"}</small></span><span className="inventory-row-price">{money(sku.price ?? product.price)}</span><label className="inventory-row-stock"><input type="number" min="0" step="1" value={inventoryRowValues[sku.id] ?? String(sku.stock)} onChange={(event) => setInventoryRowValues((current) => ({ ...current, [sku.id]: event.target.value }))} /></label><span className={`inventory-row-status ${inventoryStatus === "售罄" ? "sold-out" : inventoryStatus === "紧张" ? "tight" : "available"}`}>{inventoryStatus}</span><button type="button" className="text-link inventory-row-detail" onClick={() => selectInventorySku(product, sku)}>调整</button></article>; })}{!inventoryListRows.length && <p className="inventory-list-empty">没有匹配的 SKU。</p>}</div></section><div className="inventory-layout inventory-detail-layout"><section className="studio-panel inventory-adjustment-panel"><div className="panel-head"><h3>单个 SKU 调整</h3></div><div className="inventory-selected-product"><img src={inventoryProduct.image} alt="" /><span><small>当前作品</small><b>{inventoryProduct.title}</b></span></div><div className="inventory-summary"><span>作品可售库存</span><b>{inventoryProduct.stock}</b><small>预警阈值：{inventoryProduct.lowStockThreshold ?? 3}</small>{inventorySku && <small>当前 SKU：{inventorySku.code || "未编码"} · {money(inventorySku.price ?? inventoryProduct.price)} · {inventorySku.status === "disabled" ? "已停用" : "可售"}</small>}</div><label>SKU<select value={inventorySku?.id || ""} onChange={(event) => setInventorySkuId(event.target.value)}>{(inventoryProduct.skus || []).map((sku) => <option key={sku.id} value={sku.id}>{Object.keys(sku.optionValues).length ? Object.entries(sku.optionValues).map(([name, value]) => `${name}: ${value}`).join(" · ") : "默认规格"}（{sku.status === "disabled" ? "已停用" : `现货 ${sku.stock}`}）</option>)}</select></label>{inventorySku && <button className="secondary" onClick={() => void setInventorySkuStatus(inventorySku, inventorySku.status === "disabled" ? "active" : "disabled")}>{inventorySku.status === "disabled" ? "启用当前 SKU" : "停用当前 SKU"}</button>}<div className="inventory-form-row"><label>操作<select value={inventoryAdjustmentType} onChange={(event) => setInventoryAdjustmentType(event.target.value as typeof inventoryAdjustmentType)}><option value="increase">入库增加</option><option value="decrease">出库减少</option><option value="set">盘点设定</option></select></label><label>数量<input type="number" min="0" step="1" value={inventoryQuantity} onChange={(event) => setInventoryQuantity(event.target.value)} /></label></div><label>调整原因<input maxLength={120} value={inventoryReason} onChange={(event) => setInventoryReason(event.target.value)} placeholder="如：到货补充、盘点修正" /></label><button className="primary" onClick={() => void adjustInventory()}>确认调整</button></section><section className="studio-panel inventory-history-panel"><div className="panel-head"><h3>库存调整记录</h3><span>{inventoryAdjustments.length} 条</span></div>{inventoryAdjustments.length ? <div className="inventory-history-list">{inventoryAdjustments.map((item) => { const sku = inventoryProduct.skus?.find((value) => value.id === item.skuId); const label = sku && Object.keys(sku.optionValues).length ? Object.entries(sku.optionValues).map(([name, value]) => `${name}: ${value}`).join(" · ") : "默认规格"; return <article key={item.id}><div><b>{label}</b><small>{item.reason || "未填写原因"} · {item.createdAt}</small></div><span>{item.type === "increase" ? "+" : item.type === "decrease" ? "-" : "="}{item.type === "decrease" ? item.before - item.after : item.type === "increase" ? item.after - item.before : item.after} <em>{item.before} → {item.after}</em></span></article>; })}</div> : <p>暂无该作品的库存调整记录。</p>}</section></div></> : <Empty title="暂无作品" text="发布作品后即可管理 SKU 库存。" action="发布作品" onAction={() => { setTab("products"); setShowForm(true); }} />}
+            {inventoryProduct ? <><section className="studio-panel inventory-list-panel"><div className="panel-head"><div><h3>SKU 库存列表</h3><p>直接编辑库存，光标移出输入框后会自动保存；也可勾选多条后批量盘点。</p></div><span>{inventoryListRows.length} 个 SKU</span></div><div className="inventory-list-toolbar"><label className="inventory-list-search"><Search size={16} /><input value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} placeholder="搜索作品、SKU 或规格" /></label><input value={inventoryListReason} maxLength={120} onChange={(event) => setInventoryListReason(event.target.value)} placeholder="批量盘点原因（必填）" /><button className="secondary" disabled={!inventorySelectedSkuIds.length} onClick={() => void saveInventoryList()}>保存已选 {inventorySelectedSkuIds.length || ""}</button></div><div className="inventory-list-head"><label><input type="checkbox" checked={allVisibleInventorySelected} onChange={() => setInventorySelectedSkuIds((current) => allVisibleInventorySelected ? current.filter((id) => !inventoryListRows.some(({ sku }) => sku.id === id)) : Array.from(new Set([...current, ...inventoryListRows.map(({ sku }) => sku.id)])))} /></label><span>作品</span><span>规格 / SKU</span><span>售价</span><span>库存</span><span>状态</span></div><div className="inventory-list">{inventoryListRows.map(({ product, sku }) => { const spec = Object.keys(sku.optionValues).length ? Object.entries(sku.optionValues).map(([name, value]) => `${name}: ${value}`).join(" · ") : "默认规格"; const inventoryStatus = sku.stock === 0 ? "售罄" : sku.stock < 10 ? "紧张" : "可售"; return <article key={sku.id} className=""><label className="inventory-row-check"><input type="checkbox" checked={inventorySelectedSkuIds.includes(sku.id)} onChange={() => setInventorySelectedSkuIds((current) => current.includes(sku.id) ? current.filter((id) => id !== sku.id) : [...current, sku.id])} /><span className="sr-only">选择 {product.title}</span></label><button type="button" className="inventory-row-product" onClick={() => selectInventorySku(product, sku)}><img src={product.image} alt="" /><span><b>{product.title}</b></span></button><span className="inventory-row-sku"><b>{spec}</b><small>{sku.code || "未编码"}</small></span><span className="inventory-row-price">{money(sku.price ?? product.price)}</span><label className="inventory-row-stock"><input type="number" min="0" step="1" value={inventoryRowValues[sku.id] ?? String(sku.stock)} onChange={(event) => setInventoryRowValues((current) => ({ ...current, [sku.id]: event.target.value }))} onBlur={() => void saveInventoryRow(product, sku)} /></label><span className={`inventory-row-status ${inventoryStatus === "售罄" ? "sold-out" : inventoryStatus === "紧张" ? "tight" : "available"}`}>{inventoryStatus}</span></article>; })}{!inventoryListRows.length && <p className="inventory-list-empty">没有匹配的 SKU。</p>}</div></section><div className="inventory-layout inventory-detail-layout"><section className="studio-panel inventory-adjustment-panel"><div className="panel-head"><h3>单个 SKU 调整</h3></div><div className="inventory-selected-product"><img src={inventoryProduct.image} alt="" /><span><small>当前作品</small><b>{inventoryProduct.title}</b></span></div><div className="inventory-summary"><span>作品可售库存</span><b>{inventoryProduct.stock}</b><small>预警阈值：{inventoryProduct.lowStockThreshold ?? 3}</small>{inventorySku && <small>当前 SKU：{inventorySku.code || "未编码"} · {money(inventorySku.price ?? inventoryProduct.price)} · {inventorySku.status === "disabled" ? "已停用" : "可售"}</small>}</div><label>SKU<select value={inventorySku?.id || ""} onChange={(event) => setInventorySkuId(event.target.value)}>{(inventoryProduct.skus || []).map((sku) => <option key={sku.id} value={sku.id}>{Object.keys(sku.optionValues).length ? Object.entries(sku.optionValues).map(([name, value]) => `${name}: ${value}`).join(" · ") : "默认规格"}（{sku.status === "disabled" ? "已停用" : `现货 ${sku.stock}`}）</option>)}</select></label>{inventorySku && <button className="secondary" onClick={() => void setInventorySkuStatus(inventorySku, inventorySku.status === "disabled" ? "active" : "disabled")}>{inventorySku.status === "disabled" ? "启用当前 SKU" : "停用当前 SKU"}</button>}<div className="inventory-form-row"><label>操作<select value={inventoryAdjustmentType} onChange={(event) => setInventoryAdjustmentType(event.target.value as typeof inventoryAdjustmentType)}><option value="increase">入库增加</option><option value="decrease">出库减少</option><option value="set">盘点设定</option></select></label><label>数量<input type="number" min="0" step="1" value={inventoryQuantity} onChange={(event) => setInventoryQuantity(event.target.value)} /></label></div><label>调整原因<input maxLength={120} value={inventoryReason} onChange={(event) => setInventoryReason(event.target.value)} placeholder="如：到货补充、盘点修正" /></label><button className="primary" onClick={() => void adjustInventory()}>确认调整</button></section><section className="studio-panel inventory-history-panel"><div className="panel-head"><h3>库存调整记录</h3><span>{inventoryAdjustments.length} 条</span></div>{inventoryAdjustments.length ? <div className="inventory-history-list">{inventoryAdjustments.map((item) => { const sku = inventoryProduct.skus?.find((value) => value.id === item.skuId); const label = sku && Object.keys(sku.optionValues).length ? Object.entries(sku.optionValues).map(([name, value]) => `${name}: ${value}`).join(" · ") : "默认规格"; return <article key={item.id}><div><b>{label}</b><small>{item.reason || "未填写原因"} · {item.createdAt}</small></div><span>{item.type === "increase" ? "+" : item.type === "decrease" ? "-" : "="}{item.type === "decrease" ? item.before - item.after : item.type === "increase" ? item.after - item.before : item.after} <em>{item.before} → {item.after}</em></span></article>; })}</div> : <p>暂无该作品的库存调整记录。</p>}</section></div></> : <Empty title="暂无作品" text="发布作品后即可管理 SKU 库存。" action="发布作品" onAction={() => { openStudioTab("products"); setShowForm(true); }} />}
           </>
         )}
         {tab === "orders" && (
@@ -6241,8 +6675,8 @@ function Studio({
                         </button>
                       ) : (
                         <>
-                          <button className="secondary" onClick={() => onShipping(o.id)}>查看物流</button>
-                          {o.shipment && <button className="secondary" onClick={() => setShipmentEventOrder(o)}>更新物流</button>}
+                          <button className="text-link seller-shipping-link" type="button" onClick={() => onShipping(o.id)}>查看物流</button>
+                          {o.shipment && <button className="text-link seller-shipping-link" type="button" onClick={() => setShipmentEventOrder(o)}>更新物流</button>}
                         </>
                       )}
                     </div>
@@ -6954,7 +7388,7 @@ function SellerServiceManagementLegacy({ shopId }: { shopId: string }) {
   useEffect(() => { void load(); }, []);
   const uploadEvidence = async (file?: File) => {
     if (!file) return;
-    const data = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("图片读取失败")); reader.readAsDataURL(file); });
+    const data = await compressImageForUpload(file);
     const response = await fetch(`${API_BASE}/api/media`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ data, mediaType: "image" }) });
     const payload = await response.json().catch(() => ({})) as { url?: string; error?: string };
     if (!response.ok || !payload.url) throw new Error(payload.error || "图片上传失败");
@@ -7013,7 +7447,7 @@ function SellerServiceManagement({ shopId }: { shopId: string }) {
   useEffect(() => { void load(); }, []);
   const uploadDocument = async (file?: File) => {
     if (!file) return;
-    const data = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("图片读取失败")); reader.readAsDataURL(file); });
+    const data = await compressImageForUpload(file);
     const response = await fetch(`${API_BASE}/api/media`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ data, mediaType: "image" }) });
     const payload = await response.json().catch(() => ({})) as { url?: string; error?: string };
     if (!response.ok || !payload.url) throw new Error(payload.error || "图片上传失败");

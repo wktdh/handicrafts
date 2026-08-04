@@ -64,7 +64,7 @@
 .payout-binding-panel .panel-head { margin-bottom: 0; }
 .seller-payout-status { padding: 4px 8px; border: 1px solid #dedbd5; border-radius: 3px; color: #77716a; font-size: 12px; white-space: nowrap; }
 .seller-payout-status.bound { border-color: #bcd6c4; background: #f2faf4; color: #28754a; }
-.auth-back { display: block; margin: 17px auto 0; color: #8f421e; font-size: 13px; text-decoration: underline; }
+.auth-back { display: block; color: #8f421e; font-size: 13px; text-decoration: underline; }
 .account-name { max-width: 150px; overflow: hidden; color: #5e5a54; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .logout-button { display: inline-flex; align-items: center; gap: 6px; padding: 8px; color: #5e5a54; font-size: 14px; font-weight: 600; }
 .logout-button:hover { color: #b94d1b; }

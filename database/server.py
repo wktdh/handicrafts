@@ -44,6 +44,8 @@ SELLER_OPERATING_CATEGORIES = {
     "苔藓微景观", "羊毛毡", "皂类", "非遗",
 }
 SELLER_PAYOUT_METHODS = {"bank_card", "alipay", "wechat"}
+COMMUNITY_CATEGORIES = {"店铺经营", "商品拍摄", "定价与营销", "物流经验", "平台建议", "闲聊交流"}
+COMMUNITY_RATE_LIMITS: dict[str, list[datetime]] = {}
 
 
 def websocket_text_frame(payload: dict) -> bytes:
@@ -93,6 +95,36 @@ class LiveMessageHub:
 
 
 LIVE_MESSAGE_HUB = LiveMessageHub()
+
+
+class CommunityLiveHub:
+    """Anonymous community event fan-out; content still persists in SQLite."""
+
+    def __init__(self) -> None:
+        self.clients: dict[object, threading.Lock] = {}
+        self.lock = threading.Lock()
+
+    def add(self, client: object) -> None:
+        with self.lock:
+            self.clients[client] = threading.Lock()
+
+    def remove(self, client: object) -> None:
+        with self.lock:
+            self.clients.pop(client, None)
+
+    def publish(self, payload: dict) -> None:
+        frame = websocket_text_frame(payload)
+        with self.lock:
+            clients = list(self.clients.items())
+        for client, send_lock in clients:
+            try:
+                with send_lock:
+                    client.sendall(frame)
+            except OSError:
+                self.remove(client)
+
+
+COMMUNITY_LIVE_HUB = CommunityLiveHub()
 
 
 def web_push_is_configured() -> bool:
@@ -148,6 +180,86 @@ def number(value: object) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def community_identity(payload: dict) -> tuple[str, str]:
+    visitor_id = str(payload.get("visitorId") or "").strip()
+    nickname = re.sub(r"\s+", " ", str(payload.get("nickname") or "").strip())
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,120}", visitor_id):
+        raise ValueError("访客身份无效，请刷新页面后重试")
+    if not 2 <= len(nickname) <= 24:
+        raise ValueError("临时昵称请填写 2 到 24 个字符")
+    return visitor_id, nickname
+
+
+def community_attachment_urls(payload: dict) -> list[str]:
+    values = payload.get("attachmentUrls") if isinstance(payload.get("attachmentUrls"), list) else []
+    urls = [str(value).strip() for value in values if str(value).strip()]
+    legacy_url = str(payload.get("attachmentUrl") or "").strip()
+    if legacy_url:
+        urls.append(legacy_url)
+    urls = list(dict.fromkeys(urls))
+    if len(urls) > 6 or any(not url.startswith("/media/") or len(url) > 300 for url in urls):
+        raise ValueError("图片地址无效，最多可添加 6 张图片")
+    return urls
+
+
+def community_rate_allowed(handler: object, visitor_id: str, action: str, maximum: int, seconds: int) -> bool:
+    ip_address = getattr(handler, "client_address", ("unknown",))[0]
+    key = f"{action}:{ip_address}:{visitor_id}"
+    now = datetime.now(timezone.utc)
+    entries = [item for item in COMMUNITY_RATE_LIMITS.get(key, []) if (now - item).total_seconds() < seconds]
+    if len(entries) >= maximum:
+        COMMUNITY_RATE_LIMITS[key] = entries
+        return False
+    entries.append(now)
+    COMMUNITY_RATE_LIMITS[key] = entries
+    return True
+
+
+def community_posts_payload(connection: sqlite3.Connection, category: str = "") -> list[dict]:
+    connection.row_factory = sqlite3.Row
+    query = "SELECT * FROM community_posts WHERE status = 'published'"
+    params: tuple[object, ...] = ()
+    if category:
+        query += " AND category = ?"
+        params = (category,)
+    posts = connection.execute(f"{query} ORDER BY created_at DESC LIMIT 100", params).fetchall()
+    post_ids = [row["id"] for row in posts]
+    comments_by_post: dict[str, list[dict]] = {post_id: [] for post_id in post_ids}
+    post_images: dict[str, list[str]] = {post_id: [] for post_id in post_ids}
+    if post_ids:
+        placeholders = ",".join("?" for _ in post_ids)
+        for row in connection.execute(f"SELECT post_id, image_url FROM community_post_images WHERE post_id IN ({placeholders}) ORDER BY sort_order, created_at", post_ids).fetchall():
+            post_images[row["post_id"]].append(row["image_url"])
+    if post_ids:
+        placeholders = ",".join("?" for _ in post_ids)
+        comments = connection.execute(
+            f"SELECT * FROM community_comments WHERE post_id IN ({placeholders}) AND status = 'published' ORDER BY created_at ASC",
+            post_ids,
+        ).fetchall()
+        comment_ids = [row["id"] for row in comments]
+        comment_images: dict[str, list[str]] = {comment_id: [] for comment_id in comment_ids}
+        if comment_ids:
+            comment_placeholders = ",".join("?" for _ in comment_ids)
+            for image in connection.execute(f"SELECT comment_id, image_url FROM community_comment_images WHERE comment_id IN ({comment_placeholders}) ORDER BY sort_order, created_at", comment_ids).fetchall():
+                comment_images[image["comment_id"]].append(image["image_url"])
+        else:
+            comment_images = {}
+        for row in comments:
+            images = comment_images.get(row["id"], [])
+            if not images and row["attachment_url"]:
+                images = [row["attachment_url"]]
+            comments_by_post[row["post_id"]].append({
+                "id": row["id"], "nickname": row["nickname"], "content": row["content"], "createdAt": row["created_at"], "parentCommentId": row["parent_comment_id"], "imageUrl": images[0] if images else None, "imageUrls": images,
+            })
+    for post_id, row in zip(post_ids, posts):
+        if not post_images[post_id] and row["attachment_url"]:
+            post_images[post_id] = [row["attachment_url"]]
+    return [{
+        "id": row["id"], "nickname": row["nickname"], "category": row["category"], "title": row["title"],
+        "content": row["content"], "createdAt": row["created_at"], "imageUrl": post_images[row["id"]][0] if post_images[row["id"]] else None, "imageUrls": post_images[row["id"]], "comments": comments_by_post[row["id"]],
+    } for row in posts]
 
 
 def hash_password(password: str) -> str:
@@ -429,10 +541,11 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
     price = int(round(number(product.get("price")) * 100))
     stock = max(0, int(number(product.get("stock"))))
     low_stock_threshold = max(0, int(number(product.get("lowStockThreshold", 3))))
+    supports_custom = int(bool(product.get("custom")))
     connection.execute(
         """
-        INSERT INTO products (id, shop_id, category, title, description, material, price_cents, stock, low_stock_threshold, status, published_at, moderation_status, moderation_reason, moderated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'published' THEN CURRENT_TIMESTAMP END, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO products (id, shop_id, category, title, description, material, price_cents, stock, low_stock_threshold, supports_custom, status, published_at, moderation_status, moderation_reason, moderated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'published' THEN CURRENT_TIMESTAMP END, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
           category = excluded.category,
           title = excluded.title,
@@ -441,6 +554,7 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
           price_cents = excluded.price_cents,
           stock = excluded.stock,
           low_stock_threshold = excluded.low_stock_threshold,
+          supports_custom = excluded.supports_custom,
           status = excluded.status,
           moderation_status = excluded.moderation_status,
           moderation_reason = excluded.moderation_reason,
@@ -458,6 +572,7 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
             price,
             stock,
             low_stock_threshold,
+            supports_custom,
             effective_status,
             effective_status,
             moderation_status,
@@ -700,7 +815,7 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
                     "listed": product["status"] == "published",
                     "reviewStatus": product["moderation_status"],
                     "moderationReason": product["moderation_reason"],
-                    "custom": True,
+                    "custom": bool(product["supports_custom"]),
                     "description": product["description"],
                     "material": product["material"],
                     "variants": variants or None,
@@ -3345,6 +3460,49 @@ class Handler(BaseHTTPRequestHandler):
             LIVE_MESSAGE_HUB.remove(user_id, self.connection)
             self.close_connection = True
 
+    def handle_community_websocket(self) -> None:
+        visitor_id = str(parse_qs(urlparse(self.path).query).get("visitorId", [""])[0]).strip()
+        upgrade = self.headers.get("Upgrade", "").lower()
+        connection = self.headers.get("Connection", "").lower()
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        try:
+            valid_key = len(base64.b64decode(key.encode("ascii"), validate=True)) == 16
+        except (ValueError, binascii.Error, UnicodeEncodeError):
+            valid_key = False
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,120}", visitor_id):
+            self.send_json(400, {"error": "Community visitor identity is invalid"})
+            return
+        if upgrade != "websocket" or "upgrade" not in connection or not valid_key:
+            self.send_json(426, {"error": "WebSocket upgrade required"})
+            return
+        if not self.websocket_origin_is_allowed():
+            self.send_json(403, {"error": "WebSocket origin denied"})
+            return
+        accept = base64.b64encode(hashlib.sha1(f"{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11".encode("ascii")).digest()).decode("ascii")
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "WebSocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.wfile.flush()
+        COMMUNITY_LIVE_HUB.add(self.connection)
+        try:
+            while True:
+                frame = self.read_websocket_frame()
+                if frame is None:
+                    break
+                opcode, body = frame
+                if opcode == 0x8:
+                    self.connection.sendall(bytes((0x88, min(len(body), 125))) + body[:125])
+                    break
+                if opcode == 0x9:
+                    self.connection.sendall(bytes((0x8A, min(len(body), 125))) + body[:125])
+        except OSError:
+            pass
+        finally:
+            COMMUNITY_LIVE_HUB.remove(self.connection)
+            self.close_connection = True
+
     def send_json(self, status: int, payload: dict, cookie: str | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -3393,10 +3551,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if urlparse(self.path).path == "/ws":
             self.handle_websocket()
+        elif urlparse(self.path).path == "/ws/community":
+            self.handle_community_websocket()
         elif self.path == "/api/push/config":
             self.send_json(200, {"publicKey": VAPID_PUBLIC_KEY if web_push_is_configured() else None})
         elif self.path == "/health":
             self.send_json(200, {"ok": True})
+        elif urlparse(self.path).path == "/api/community/posts":
+            category = str(parse_qs(urlparse(self.path).query).get("category", [""])[0]).strip()
+            if category and category not in COMMUNITY_CATEGORIES:
+                self.send_json(400, {"error": "社区分类无效"})
+                return
+            with database() as connection:
+                self.send_json(200, {"posts": community_posts_payload(connection, category)})
         elif self.path.startswith("/media/"):
             self.send_media(self.path.removeprefix("/media/"))
         elif self.path == "/api/catalog/products":
@@ -4163,7 +4330,103 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            if self.path == "/api/integrations/customer-service/webhooks":
+            if self.path == "/api/community/media":
+                if not isinstance(payload, dict):
+                    raise ValueError("图片内容无效")
+                visitor_id = str(payload.get("visitorId") or "").strip()
+                if not re.fullmatch(r"[A-Za-z0-9_-]{8,120}", visitor_id):
+                    raise ValueError("访客身份无效，请刷新页面后重试")
+                if not community_rate_allowed(self, visitor_id, "media", 12, 600):
+                    self.send_json(429, {"error": "图片上传过于频繁，请稍后再试"})
+                    return
+                mime_type, binary = decode_media_data_url(payload.get("data"), "image")
+                MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+                filename = f"community-{secrets.token_urlsafe(16)}{IMAGE_MIME_TYPES[mime_type]}"
+                (MEDIA_DIR / filename).write_bytes(binary)
+                self.send_json(201, {"url": f"/media/{filename}"})
+            elif self.path == "/api/community/posts":
+                if not isinstance(payload, dict):
+                    raise ValueError("发帖内容无效")
+                visitor_id, nickname = community_identity(payload)
+                category = str(payload.get("category") or "").strip()
+                title = re.sub(r"\s+", " ", str(payload.get("title") or "").strip())
+                content = str(payload.get("content") or "").strip()
+                attachment_urls = community_attachment_urls(payload)
+                if category not in COMMUNITY_CATEGORIES:
+                    raise ValueError("请选择社区分类")
+                if not 2 <= len(title) <= 80:
+                    raise ValueError("标题请填写 2 到 80 个字符")
+                if not 2 <= len(content) <= 2000:
+                    raise ValueError("正文请填写 2 到 2000 个字符")
+                if next((word for word in SENSITIVE_CONTENT_WORDS if word in f"{title}\n{content}"), None):
+                    raise ValueError("内容未通过基础审核，请调整后再发布")
+                if not community_rate_allowed(self, visitor_id, "post", 4, 600):
+                    self.send_json(429, {"error": "发帖过于频繁，请稍后再试"})
+                    return
+                post_id = f"community-post-{secrets.token_urlsafe(10)}"
+                with database() as connection:
+                    connection.execute(
+                        "INSERT INTO community_posts (id, visitor_id, nickname, category, title, content, attachment_url) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (post_id, visitor_id, nickname, category, title, content, attachment_urls[0] if attachment_urls else None),
+                    )
+                    connection.executemany("INSERT INTO community_post_images (id, post_id, image_url, sort_order) VALUES (?, ?, ?, ?)", [(f"community-post-image-{secrets.token_urlsafe(8)}", post_id, url, index) for index, url in enumerate(attachment_urls)])
+                    post = next(item for item in community_posts_payload(connection) if item["id"] == post_id)
+                COMMUNITY_LIVE_HUB.publish({"type": "community_post_created", "postId": post_id})
+                self.send_json(201, {"post": post})
+            elif self.path.startswith("/api/community/posts/") and self.path.endswith("/comments"):
+                if not isinstance(payload, dict):
+                    raise ValueError("评论内容无效")
+                visitor_id, nickname = community_identity(payload)
+                post_id = self.path.removeprefix("/api/community/posts/").removesuffix("/comments").rstrip("/")
+                parent_comment_id = str(payload.get("parentCommentId") or "").strip() or None
+                content = str(payload.get("content") or "").strip()
+                attachment_urls = community_attachment_urls(payload)
+                if not post_id or not 2 <= len(content) <= 500:
+                    raise ValueError("评论请填写 2 到 500 个字符")
+                if next((word for word in SENSITIVE_CONTENT_WORDS if word in content), None):
+                    raise ValueError("内容未通过基础审核，请调整后再发布")
+                if not community_rate_allowed(self, visitor_id, "comment", 12, 600):
+                    self.send_json(429, {"error": "评论过于频繁，请稍后再试"})
+                    return
+                comment_id = f"community-comment-{secrets.token_urlsafe(10)}"
+                with database() as connection:
+                    post = connection.execute("SELECT id FROM community_posts WHERE id = ? AND status = 'published'", (post_id,)).fetchone()
+                    if not post:
+                        self.send_json(404, {"error": "帖子不存在或已隐藏"})
+                        return
+                    if parent_comment_id and not connection.execute("SELECT 1 FROM community_comments WHERE id = ? AND post_id = ? AND status = 'published'", (parent_comment_id, post_id)).fetchone():
+                        raise ValueError("回复的评论不存在或已隐藏")
+                    connection.execute(
+                        "INSERT INTO community_comments (id, post_id, visitor_id, nickname, content, parent_comment_id, attachment_url) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (comment_id, post_id, visitor_id, nickname, content, parent_comment_id, attachment_urls[0] if attachment_urls else None),
+                    )
+                    connection.executemany("INSERT INTO community_comment_images (id, comment_id, image_url, sort_order) VALUES (?, ?, ?, ?)", [(f"community-comment-image-{secrets.token_urlsafe(8)}", comment_id, url, index) for index, url in enumerate(attachment_urls)])
+                    comment = connection.execute("SELECT id, nickname, content, created_at, parent_comment_id, attachment_url FROM community_comments WHERE id = ?", (comment_id,)).fetchone()
+                COMMUNITY_LIVE_HUB.publish({"type": "community_comment_created", "postId": post_id, "commentId": comment_id})
+                self.send_json(201, {"comment": {"id": comment[0], "nickname": comment[1], "content": comment[2], "createdAt": comment[3], "parentCommentId": comment[4], "imageUrl": comment[5], "imageUrls": attachment_urls}})
+            elif self.path == "/api/community/reports":
+                if not isinstance(payload, dict):
+                    raise ValueError("举报内容无效")
+                visitor_id, _ = community_identity(payload)
+                target_type = str(payload.get("targetType") or "")
+                target_id = str(payload.get("targetId") or "").strip()
+                reason = str(payload.get("reason") or "").strip()
+                if target_type not in ("post", "comment") or not target_id or not 2 <= len(reason) <= 120:
+                    raise ValueError("请填写举报对象和原因")
+                if not community_rate_allowed(self, visitor_id, "report", 8, 3600):
+                    self.send_json(429, {"error": "举报提交过于频繁，请稍后再试"})
+                    return
+                table = "community_posts" if target_type == "post" else "community_comments"
+                with database() as connection:
+                    if not connection.execute(f"SELECT 1 FROM {table} WHERE id = ?", (target_id,)).fetchone():
+                        self.send_json(404, {"error": "举报对象不存在"})
+                        return
+                    if connection.execute("SELECT 1 FROM community_reports WHERE visitor_id = ? AND target_type = ? AND target_id = ? AND status = 'pending'", (visitor_id, target_type, target_id)).fetchone():
+                        raise ValueError("你已经举报过该内容，请等待处理")
+                    report_id = f"community-report-{secrets.token_urlsafe(10)}"
+                    connection.execute("INSERT INTO community_reports (id, visitor_id, target_type, target_id, reason) VALUES (?, ?, ?, ?, ?)", (report_id, visitor_id, target_type, target_id, reason))
+                self.send_json(201, {"report": {"id": report_id, "status": "pending"}})
+            elif self.path == "/api/integrations/customer-service/webhooks":
                 if not CUSTOMER_SERVICE_WEBHOOK_SECRET:
                     self.send_json(503, {"error": "Customer service webhook is not configured"})
                     return
