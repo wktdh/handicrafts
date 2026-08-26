@@ -2,24 +2,18 @@ import { expect, test } from "@playwright/test";
 
 test("guest can search and sort discovered products", async ({ page }) => {
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  const search = page.getByPlaceholder("搜索手作、原创设计、复古好物");
-  await search.fill("陶瓷");
+  const search = page.locator(".search input");
+  await search.fill("ceramic");
   await search.press("Enter");
-  await expect(page.locator(".discover-heading")).toContainText("陶瓷");
+  await expect(page.locator(".discover-heading")).toContainText("Search results");
   await page.locator(".search-sort select").selectOption("price_asc");
 });
 
-test("guest can use autocomplete to open a search result", async ({ page }) => {
+test("guest can submit a search with the header button", async ({ page }) => {
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  await expect(page.locator(".search-autocomplete")).toBeHidden();
-  await page.getByPlaceholder("搜索手作、原创设计、复古好物").fill("咖");
-  const suggestions = page.locator(".search-autocomplete");
-  await expect(suggestions).toBeVisible();
-  await page.locator(".hero").click({ position: { x: 8, y: 340 } });
-  await expect(suggestions).toBeHidden();
-  await page.getByPlaceholder("搜索手作、原创设计、复古好物").focus();
-  await expect(suggestions).toBeVisible();
-  await suggestions.getByRole("option").first().click();
+  const search = page.locator(".search input");
+  await search.fill("coffee");
+  await page.locator(".search button").click();
   await expect(page.locator(".discover-heading")).toBeVisible();
   await expect(page.locator(".product-grid .product-card").first()).toBeVisible();
 });

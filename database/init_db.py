@@ -13,8 +13,9 @@ def run_sql_file(connection: sqlite3.Connection, path: Path) -> None:
     connection.executescript(path.read_text(encoding="utf-8"))
 
 
-def main() -> None:
-    with sqlite3.connect(DB_PATH) as connection:
+def main(*, verbose: bool = True) -> None:
+    connection = sqlite3.connect(DB_PATH)
+    try:
         configure_connection(connection)
         connection.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
@@ -30,7 +31,10 @@ def main() -> None:
                 )
         run_sql_file(connection, ROOT / "seed.sql")
         connection.commit()
-    print(f"Database initialized: {DB_PATH}")
+    finally:
+        connection.close()
+    if verbose:
+        print(f"Database initialized: {DB_PATH}")
 
 
 if __name__ == "__main__":

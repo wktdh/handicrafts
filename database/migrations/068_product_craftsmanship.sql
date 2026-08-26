@@ -1,0 +1,1 @@
+ALTER TABLE products ADD COLUMN craftsmanship TEXT NOT NULL DEFAULT '';

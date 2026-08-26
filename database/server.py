@@ -1,17 +1,32 @@
 import base64
 import binascii
 import hashlib
+import hmac
+import ipaddress
+import io
 import json
+import math
 import re
 import secrets
+import smtplib
 import threading
+import time
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sqlite3
 import os
 from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlite_config import connect as sqlite_connect
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 try:
     from pywebpush import WebPushException, webpush
@@ -19,33 +34,375 @@ except ImportError:  # Allows local API development before the optional push dep
     WebPushException = Exception
     webpush = None
 
+try:
+    from qcloud_cos import CosConfig, CosS3Client
+except ImportError:  # COS is optional in local development and test environments.
+    CosConfig = None
+    CosS3Client = None
+
+try:
+    from PIL import Image, ImageOps, UnidentifiedImageError
+except ImportError:  # Production installs Pillow; keeping this optional preserves local API tooling.
+    Image = ImageOps = None
+    UnidentifiedImageError = Exception
+
+
+class SlidingWindowRateLimiter:
+    """Thread-safe, in-process protection for costly browser actions.
+
+    The API is served by one threaded Supervisor process today, so keeping only
+    recent timestamps in memory avoids adding a database write on every normal
+    request. Limits are intentionally scoped by both account and client IP at
+    their call sites. If the API is later scaled to multiple processes, move
+    this implementation to Redis so the quota is shared across workers.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, scope: str, subject: str, maximum: int, window_seconds: int) -> tuple[bool, int]:
+        now = time.monotonic()
+        key = f"{scope}:{subject}"
+        with self._lock:
+            # Login identifiers are client supplied. Bound the cache so a bot
+            # cannot turn the limiter itself into a memory exhaustion target.
+            if key not in self._events and len(self._events) >= 10_000:
+                self._events.pop(next(iter(self._events)))
+            entries = [item for item in self._events.get(key, []) if now - item < window_seconds]
+            if len(entries) >= maximum:
+                self._events[key] = entries
+                retry_after = max(1, math.ceil(window_seconds - (now - entries[0])))
+                return False, retry_after
+            entries.append(now)
+            self._events[key] = entries
+            return True, 0
+
 
 ROOT = Path(__file__).resolve().parent
+
+
+def load_local_environment(path: Path) -> None:
+    """Load simple KEY=VALUE pairs locally when python-dotenv is unavailable."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+if load_dotenv:
+    load_dotenv(ROOT.parent / ".env")
+else:
+    load_local_environment(ROOT.parent / ".env")
 DB_PATH = Path(os.environ.get("HANDICRAFTS_DB_PATH", ROOT / "handicrafts.db"))
 MEDIA_DIR = Path(os.environ.get("HANDICRAFTS_MEDIA_DIR", ROOT.parent / "src" / "images" / "uploads"))
+QUARANTINE_MEDIA_DIR = Path(os.environ.get("HANDICRAFTS_QUARANTINE_MEDIA_DIR", ROOT / "media-quarantine"))
 LEGACY_MEDIA_DIR = ROOT / "media"
 SESSION_SECRET = os.environ.get("HANDICRAFTS_SESSION_SECRET", "development-only-change-me")
 PRODUCTION_HTTPS = os.environ.get("HANDICRAFTS_HTTPS", "0") == "1"
+# During the public test phase, registration must be usable before the SMS
+# provider is connected. Set this to 0 when switching to production SMS.
+REGISTRATION_TEST_MODE = os.environ.get("HANDICRAFTS_REGISTRATION_TEST_MODE", "1") == "1"
+TENCENT_SMS_SECRET_ID = os.environ.get("TENCENT_SMS_SECRET_ID", "").strip()
+TENCENT_SMS_SECRET_KEY = os.environ.get("TENCENT_SMS_SECRET_KEY", "").strip()
+TENCENT_SMS_APP_ID = os.environ.get("TENCENT_SMS_APP_ID", "").strip()
+TENCENT_SMS_SIGN_NAME = os.environ.get("TENCENT_SMS_SIGN_NAME", "").strip()
+TENCENT_SMS_REGION = os.environ.get("TENCENT_SMS_REGION", "ap-guangzhou").strip() or "ap-guangzhou"
+TENCENT_SMS_ENABLED = os.environ.get("HANDICRAFTS_SMS_ENABLED", "0") == "1"
+TENCENT_SMS_TEMPLATES = {
+    "contact_verify": os.environ.get("TENCENT_SMS_TEMPLATE_VERIFICATION", "2705679").strip(),
+    "password_reset": os.environ.get("TENCENT_SMS_TEMPLATE_VERIFICATION", "2705679").strip(),
+    "admin_step_up": os.environ.get("TENCENT_SMS_TEMPLATE_ADMIN_STEP_UP", "2705713").strip(),
+    "logistics_alert": os.environ.get("TENCENT_SMS_TEMPLATE_LOGISTICS_ALERT", "2705684").strip(),
+    "settlement": os.environ.get("TENCENT_SMS_TEMPLATE_SETTLEMENT", "2705683").strip(),
+    "seller_rejected": os.environ.get("TENCENT_SMS_TEMPLATE_SELLER_REJECTED", "2705682").strip(),
+    "seller_accepted": os.environ.get("TENCENT_SMS_TEMPLATE_SELLER_ACCEPTED", "2705681").strip(),
+    "seller_message_urgent": os.environ.get("TENCENT_SMS_TEMPLATE_SELLER_MESSAGE_URGENT", "").strip(),
+}
 SENSITIVE_CONTENT_WORDS = ("赌博", "博彩", "色情", "成人", "毒品", "枪支", "仿真枪", "管制刀具", "盗版", "假货")
 IMAGE_MIME_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 VIDEO_MIME_TYPES = {"video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_VIDEO_BYTES = 50 * 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 70 * 1024 * 1024
 LOGIN_FAILURES: dict[str, list[datetime]] = {}
+LOGIN_FAILURES_LOCK = threading.Lock()
+SMS_REQUESTS: dict[str, list[datetime]] = {}
+REQUEST_RATE_LIMITER = SlidingWindowRateLimiter()
 ORDER_EXPIRY_SCAN_SECONDS = max(5, int(os.environ.get("HANDICRAFTS_ORDER_EXPIRY_SCAN_SECONDS", "30")))
 CUSTOMER_SERVICE_WEBHOOK_SECRET = os.environ.get("CUSTOMER_SERVICE_WEBHOOK_SECRET", "")
+LOGISTICS_WEBHOOK_SECRET = os.environ.get("HANDICRAFTS_LOGISTICS_WEBHOOK_SECRET", "")
+ALLOWED_BROWSER_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("HANDICRAFTS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+}
 LIANLIAN_MODE = os.environ.get("HANDICRAFTS_LIANLIAN_MODE", "unconfigured").strip().lower()
+AUTO_APPROVE_SELLER_VERIFICATION = os.environ.get("HANDICRAFTS_AUTO_APPROVE_SELLER_VERIFICATION", "1").strip() == "1"
 VAPID_PUBLIC_KEY = os.environ.get("HANDICRAFTS_VAPID_PUBLIC_KEY", "").strip()
 VAPID_PRIVATE_KEY = os.environ.get("HANDICRAFTS_VAPID_PRIVATE_KEY", "").strip()
 VAPID_SUBJECT = os.environ.get("HANDICRAFTS_VAPID_SUBJECT", "mailto:admin@example.com").strip()
+PRODUCT_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+SKU_CODE_ALPHABET = PRODUCT_CODE_ALPHABET
 SELLER_OPERATING_CATEGORIES = {
     "布艺缝纫", "黏土&塑形", "滴胶&树脂", "编织", "木质&木艺", "皮具", "首饰", "陶艺陶瓷",
     "刺绣", "花艺干花", "香薰蜡烛 & 香氛", "古风国风", "绘画肌理", "纸品文创", "宠物专属",
-    "苔藓微景观", "羊毛毡", "皂类", "非遗",
+    "微缩景观", "羊毛毡", "皂类", "非遗",
 }
 SELLER_PAYOUT_METHODS = {"bank_card", "alipay", "wechat"}
-COMMUNITY_CATEGORIES = {"店铺经营", "商品拍摄", "定价与营销", "物流经验", "平台建议", "闲聊交流"}
+SELLER_PAYOUT_SCHEDULES = {"daily", "weekly", "biweekly", "monthly"}
+SETTLEMENT_MIN_PAYOUT_CENTS = 2500
+SETTLEMENT_HOLD_BUSINESS_DAYS = 3
+NEW_SELLER_RISK_WINDOW_DAYS = 90
+PLATFORM_CURRENCY = "USD"
+USD_EXCHANGE_RATE = "1.00000000"
+SHIPPING_COUNTRIES = {
+    "US": "United States", "CA": "Canada", "GB": "United Kingdom",
+    "DE": "Germany", "FR": "France", "IT": "Italy", "ES": "Spain",
+    "NL": "Netherlands", "BE": "Belgium", "AT": "Austria", "IE": "Ireland",
+    "SE": "Sweden", "DK": "Denmark", "FI": "Finland", "PT": "Portugal",
+    "PL": "Poland", "CZ": "Czechia", "LU": "Luxembourg",
+}
+DEFAULT_NORTH_AMERICA_COUNTRIES = ("US", "CA")
+DEFAULT_EUROPE_COUNTRIES = (
+    "GB", "DE", "FR", "IT", "ES", "NL", "BE", "AT", "IE", "SE", "DK", "FI", "PT", "PL", "CZ", "LU",
+)
+COMMUNITY_CATEGORIES = {"店铺经营", "商品拍摄", "定价营销", "物流经验", "平台建议", "平台公告", "闲聊交流"}
 COMMUNITY_RATE_LIMITS: dict[str, list[datetime]] = {}
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-terra").strip()
+VISION_API_KEY = os.environ.get("VISION_API_KEY", "").strip()
+VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "").strip().rstrip("/")
+VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-plus").strip()
+SMTP_HOST = os.environ.get("HANDICRAFTS_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("HANDICRAFTS_SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("HANDICRAFTS_SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.environ.get("HANDICRAFTS_SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("HANDICRAFTS_SMTP_FROM", SMTP_USERNAME).strip()
+SMTP_STARTTLS = os.environ.get("HANDICRAFTS_SMTP_STARTTLS", "1") == "1"
+MESSAGE_AUTOMATION_SCAN_SECONDS = max(15, int(os.environ.get("HANDICRAFTS_MESSAGE_AUTOMATION_SCAN_SECONDS", "30")))
+
+
+def validate_production_configuration() -> None:
+    """Reject unsafe production defaults before the API begins serving traffic."""
+    if not PRODUCTION_HTTPS:
+        return
+    problems = []
+    if SESSION_SECRET == "development-only-change-me" or len(SESSION_SECRET) < 32:
+        problems.append("HANDICRAFTS_SESSION_SECRET must be a random value of at least 32 characters")
+    if REGISTRATION_TEST_MODE:
+        problems.append("HANDICRAFTS_REGISTRATION_TEST_MODE must be 0")
+    if AUTO_APPROVE_SELLER_VERIFICATION:
+        problems.append("HANDICRAFTS_AUTO_APPROVE_SELLER_VERIFICATION must be 0")
+    if not ALLOWED_BROWSER_ORIGINS:
+        problems.append("HANDICRAFTS_ALLOWED_ORIGINS must include the public HTTPS origins")
+    if problems:
+        raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
+
+
+def public_cos_settings() -> dict[str, str] | None:
+    """Return public-media COS settings only when every required value is present.
+
+    Keeping the configuration in environment variables lets local development retain
+    the filesystem backend and prevents cloud credentials from reaching the browser.
+    """
+    secret_id = os.environ.get("HANDICRAFTS_COS_SECRET_ID", "").strip()
+    secret_key = os.environ.get("HANDICRAFTS_COS_SECRET_KEY", "").strip()
+    bucket = os.environ.get("HANDICRAFTS_COS_BUCKET", "").strip()
+    cdn_base_url = os.environ.get("HANDICRAFTS_COS_CDN_BASE_URL", "").strip().rstrip("/")
+    if not all((secret_id, secret_key, bucket, cdn_base_url)):
+        return None
+    return {
+        "secret_id": secret_id,
+        "secret_key": secret_key,
+        "bucket": bucket,
+        "region": os.environ.get("HANDICRAFTS_COS_REGION", "ap-guangzhou").strip() or "ap-guangzhou",
+        "cdn_base_url": cdn_base_url,
+        "prefix": os.environ.get("HANDICRAFTS_COS_PUBLIC_PREFIX", "products").strip("/ ") or "products",
+        "quarantine_prefix": os.environ.get("HANDICRAFTS_COS_QUARANTINE_PREFIX", "quarantine").strip("/ ") or "quarantine",
+    }
+
+
+def public_cos_media_key(url: object) -> str | None:
+    """Map a CDN URL produced by this service back to its COS object key."""
+    settings = public_cos_settings()
+    value = str(url or "")
+    if not settings or not value.startswith(f"{settings['cdn_base_url']}/"):
+        return None
+    key = urlparse(value).path.lstrip("/")
+    prefix = f"{settings['prefix']}/"
+    return key if key.startswith(prefix) else None
+
+
+def cos_client(settings: dict[str, str]) -> object:
+    if CosConfig is None or CosS3Client is None:
+        raise RuntimeError("COS 上传已启用，但未安装 cos-python-sdk-v5；请重新安装 requirements.txt")
+    return CosS3Client(CosConfig(Region=settings["region"], SecretId=settings["secret_id"], SecretKey=settings["secret_key"]))
+
+
+def create_public_cos_upload_ticket(user_id: str, mime_type: str, byte_size: int, content_hash: str | None = None, media_type: str = "image") -> dict[str, object]:
+    """Create a short-lived PUT URL in the non-public product-media quarantine."""
+    settings = public_cos_settings()
+    if not settings:
+        raise ValueError("COS 尚未配置，暂不能直传图片")
+    allowed = IMAGE_MIME_TYPES if media_type == "image" else VIDEO_MIME_TYPES
+    maximum_size = MAX_IMAGE_BYTES if media_type == "image" else MAX_VIDEO_BYTES
+    if media_type not in {"image", "video"} or mime_type not in allowed or not 0 < byte_size <= maximum_size:
+        raise ValueError("图片类型或大小无效")
+    created = datetime.now(timezone.utc)
+    filename = f"{media_type}-{secrets.token_urlsafe(16)}{allowed[mime_type]}"
+    storage_key = f"{settings['quarantine_prefix']}/{created:%Y/%m}/{filename}"
+    try:
+        upload_url = cos_client(settings).get_presigned_url(
+            Method="PUT",
+            Bucket=settings["bucket"],
+            Key=storage_key,
+            Params={},
+            Headers={"Content-Type": mime_type},
+            Expired=600,
+        )
+    except Exception as error:
+        raise RuntimeError("无法创建 COS 直传签名，请检查 CAM 权限和存储桶配置") from error
+    asset_id = f"asset-{secrets.token_urlsafe(12)}"
+    verified_hash = content_hash if content_hash and re.fullmatch(r"[a-f0-9]{64}", content_hash) else None
+    with database() as connection:
+        connection.execute(
+            "INSERT INTO media_assets (id, uploader_user_id, media_type, mime_type, storage_key, public_url, byte_size, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (asset_id, user_id, media_type, mime_type, storage_key, f"/api/seller/media/assets/{asset_id}/preview", byte_size, verified_hash),
+        )
+    return {"id": asset_id, "assetId": asset_id, "uploadUrl": upload_url, "previewUrl": f"/api/seller/media/assets/{asset_id}/preview", "headers": {"Content-Type": mime_type}, "expiresIn": 600}
+
+
+def cos_object_bytes(settings: dict[str, str], storage_key: str) -> bytes:
+    try:
+        response = cos_client(settings).get_object(Bucket=settings["bucket"], Key=storage_key)
+        return response["Body"].get_raw_stream().read()
+    except Exception as error:
+        raise ValueError("隔离媒体不存在或无法读取，请重新上传") from error
+
+
+def sanitise_product_image(binary: bytes, expected_mime_type: str) -> bytes:
+    """Decode, bound and re-encode an image so EXIF and disguised files are removed."""
+    if Image is None or ImageOps is None:
+        raise RuntimeError("图片安全处理依赖 Pillow，生产环境请安装 requirements.txt")
+    formats = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
+    try:
+        with Image.open(io.BytesIO(binary)) as source:
+            if source.format != formats[expected_mime_type]:
+                raise ValueError("图片实际格式与声明类型不一致")
+            source.verify()
+        with Image.open(io.BytesIO(binary)) as source:
+            image = ImageOps.exif_transpose(source)
+            if image.width < 1 or image.height < 1 or image.width * image.height > 40_000_000:
+                raise ValueError("图片像素尺寸不符合要求")
+            if expected_mime_type == "image/jpeg":
+                image = image.convert("RGB")
+            elif expected_mime_type == "image/png" and image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            elif expected_mime_type == "image/webp" and image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            output = io.BytesIO()
+            image.save(output, format=formats[expected_mime_type], optimize=True)
+            return output.getvalue()
+    except (UnidentifiedImageError, OSError, ValueError) as error:
+        raise ValueError("图片内容无法通过安全校验") from error
+
+
+def validate_product_video(binary: bytes, expected_mime_type: str) -> bytes:
+    """Reject common disguised files before a video can enter the public bucket."""
+    is_iso_base_media = len(binary) >= 12 and binary[4:8] == b"ftyp"
+    valid = (
+        expected_mime_type in {"video/mp4", "video/quicktime"} and is_iso_base_media
+    ) or (expected_mime_type == "video/webm" and binary.startswith(b"\x1a\x45\xdf\xa3"))
+    if not valid:
+        raise ValueError("视频内容无法通过安全校验")
+    return binary
+
+
+def complete_product_media_upload(user_id: str, asset_id: str) -> dict[str, object]:
+    """Verify and sanitise a quarantined direct upload before product use."""
+    with database() as connection:
+        connection.row_factory = sqlite3.Row
+        asset = connection.execute(
+            "SELECT * FROM media_assets WHERE id = ? AND uploader_user_id = ? AND status = 'temporary'",
+            (asset_id, user_id),
+        ).fetchone()
+        if not asset:
+            raise ValueError("媒体不存在、无权操作，或已完成处理")
+        settings = public_cos_settings()
+        if not settings or not str(asset["storage_key"]).startswith(f"{settings['quarantine_prefix']}/"):
+            raise ValueError("该媒体不属于 COS 隔离上传任务")
+        original = cos_object_bytes(settings, asset["storage_key"])
+        if len(original) != int(asset["byte_size"]):
+            raise ValueError("上传文件大小与签名请求不一致")
+        actual_hash = hashlib.sha256(original).hexdigest()
+        expected_hash = str(asset["content_hash"] or "")
+        if expected_hash and not hmac.compare_digest(expected_hash, actual_hash):
+            raise ValueError("上传文件校验和不一致")
+        sanitized = (
+            sanitise_product_image(original, asset["mime_type"])
+            if asset["media_type"] == "image"
+            else validate_product_video(original, asset["mime_type"])
+        )
+        try:
+            cos_client(settings).put_object(
+                Bucket=settings["bucket"], Key=asset["storage_key"], Body=sanitized,
+                ContentType=asset["mime_type"], CacheControl="no-store",
+            )
+        except Exception as error:
+            raise RuntimeError("无法完成隔离媒体处理") from error
+        connection.execute(
+            "UPDATE media_assets SET byte_size = ?, content_hash = ?, moderation_status = 'approved', verified_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (len(sanitized), hashlib.sha256(sanitized).hexdigest(), asset_id),
+        )
+    return {"id": asset_id, "assetId": asset_id, "previewUrl": f"/api/seller/media/assets/{asset_id}/preview", "status": "temporary"}
+
+
+def upload_public_media_to_cos(filename: str, mime_type: str, binary: bytes) -> tuple[str, str] | None:
+    """Upload public catalogue media and return its COS key and CDN URL.
+
+    Returning None deliberately preserves the local media path when COS has not
+    been configured, which keeps development and automated tests self-contained.
+    """
+    settings = public_cos_settings()
+    if not settings:
+        return None
+    created = datetime.now(timezone.utc)
+    storage_key = f"{settings['prefix']}/{created:%Y/%m}/{filename}"
+    try:
+        client = cos_client(settings)
+        client.put_object(
+            Bucket=settings["bucket"],
+            Key=storage_key,
+            Body=binary,
+            ContentType=mime_type,
+            CacheControl="public, max-age=31536000, immutable",
+        )
+    except Exception as error:
+        raise RuntimeError("商品图片上传到 COS 失败，请检查 CAM 权限、存储桶和地域配置") from error
+    return storage_key, f"{settings['cdn_base_url']}/{storage_key}"
+
+
+def delete_public_media_from_cos(storage_key: str) -> bool:
+    settings = public_cos_settings()
+    if not settings or not storage_key.startswith(f"{settings['prefix']}/"):
+        return False
+    try:
+        cos_client(settings).delete_object(Bucket=settings["bucket"], Key=storage_key)
+        return True
+    except Exception:
+        return False
 
 
 def websocket_text_frame(payload: dict) -> bytes:
@@ -182,9 +539,18 @@ def number(value: object) -> float:
         return 0
 
 
-def community_identity(payload: dict) -> tuple[str, str]:
+def community_identity(handler: BaseHTTPRequestHandler, payload: dict) -> tuple[str, str]:
     visitor_id = str(payload.get("visitorId") or "").strip()
     nickname = re.sub(r"\s+", " ", str(payload.get("nickname") or "").strip())
+    if not nickname:
+        user_id = session_user(handler)
+        if user_id:
+            with database() as connection:
+                user = connection.execute(
+                    "SELECT display_name FROM users WHERE id = ? AND status = 'active'",
+                    (user_id,),
+                ).fetchone()
+            nickname = re.sub(r"\s+", " ", str(user[0] if user else "").strip())
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,120}", visitor_id):
         raise ValueError("访客身份无效，请刷新页面后重试")
     if not 2 <= len(nickname) <= 24:
@@ -224,7 +590,10 @@ def community_posts_payload(connection: sqlite3.Connection, category: str = "") 
     if category:
         query += " AND category = ?"
         params = (category,)
-    posts = connection.execute(f"{query} ORDER BY created_at DESC LIMIT 100", params).fetchall()
+    posts = connection.execute(
+        f"{query} ORDER BY is_pinned DESC, pinned_at DESC, created_at DESC LIMIT 100",
+        params,
+    ).fetchall()
     post_ids = [row["id"] for row in posts]
     comments_by_post: dict[str, list[dict]] = {post_id: [] for post_id in post_ids}
     post_images: dict[str, list[str]] = {post_id: [] for post_id in post_ids}
@@ -257,9 +626,31 @@ def community_posts_payload(connection: sqlite3.Connection, category: str = "") 
         if not post_images[post_id] and row["attachment_url"]:
             post_images[post_id] = [row["attachment_url"]]
     return [{
-        "id": row["id"], "nickname": row["nickname"], "category": row["category"], "title": row["title"],
-        "content": row["content"], "createdAt": row["created_at"], "imageUrl": post_images[row["id"]][0] if post_images[row["id"]] else None, "imageUrls": post_images[row["id"]], "comments": comments_by_post[row["id"]],
+        "id": row["id"], "nickname": row["nickname"], "category": f"置顶 · {row['category']}" if row["is_pinned"] else row["category"], "title": row["title"],
+        "content": row["content"], "createdAt": row["created_at"], "pinned": bool(row["is_pinned"]), "imageUrl": post_images[row["id"]][0] if post_images[row["id"]] else None, "imageUrls": post_images[row["id"]], "comments": comments_by_post[row["id"]],
     } for row in posts]
+
+
+def admin_community_posts_payload(connection: sqlite3.Connection) -> list[dict]:
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute(
+        """
+        SELECT community_posts.*, COALESCE((SELECT image_url FROM community_post_images WHERE post_id = community_posts.id ORDER BY sort_order, created_at LIMIT 1), community_posts.attachment_url) AS image_url, COUNT(community_comments.id) AS comment_count
+        FROM community_posts
+        LEFT JOIN community_comments
+          ON community_comments.post_id = community_posts.id
+          AND community_comments.status = 'published'
+        WHERE community_posts.status = 'published'
+        GROUP BY community_posts.id
+        ORDER BY community_posts.is_pinned DESC, community_posts.pinned_at DESC, community_posts.created_at DESC
+        LIMIT 100
+        """
+    ).fetchall()
+    return [{
+        "id": row["id"], "nickname": row["nickname"], "category": row["category"],
+        "title": row["title"], "content": row["content"], "createdAt": row["created_at"],
+        "pinned": bool(row["is_pinned"]), "commentCount": row["comment_count"], "imageUrl": row["image_url"],
+    } for row in rows]
 
 
 def hash_password(password: str) -> str:
@@ -272,11 +663,148 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(f"{SESSION_SECRET}:{token}".encode("utf-8")).hexdigest()
 
 
+class SmsDeliveryError(ValueError):
+    """A safe, user-facing error for an unsuccessful SMS delivery."""
+
+
+def tencent_sms_is_configured() -> bool:
+    return bool(
+        TENCENT_SMS_SECRET_ID
+        and TENCENT_SMS_SECRET_KEY
+        and TENCENT_SMS_APP_ID
+        and TENCENT_SMS_SIGN_NAME
+    )
+
+
+def tencent_sms_phone_number(destination: str) -> str:
+    """Return a Tencent Cloud E.164 destination for a mainland China mobile."""
+    phone = re.sub(r"[\s-]", "", str(destination or ""))
+    if phone.startswith("+86"):
+        phone = phone[3:]
+    elif phone.startswith("0086"):
+        phone = phone[4:]
+    if not re.fullmatch(r"1\d{10}", phone):
+        raise SmsDeliveryError("短信验证码仅支持已绑定的中国大陆手机号码")
+    return f"+86{phone}"
+
+
+def sms_request_allowed(handler: BaseHTTPRequestHandler, destination: str, purpose: str) -> bool:
+    """Apply a small in-memory limit before any billable SMS request."""
+    now = datetime.now(timezone.utc)
+    ip_address = getattr(handler, "client_address", ("unknown",))[0]
+    key = f"{ip_address}:{destination}:{purpose}"
+    requests = [item for item in SMS_REQUESTS.get(key, []) if (now - item).total_seconds() < 600]
+    if (requests and (now - requests[-1]).total_seconds() < 60) or len(requests) >= 5:
+        SMS_REQUESTS[key] = requests
+        return False
+    requests.append(now)
+    SMS_REQUESTS[key] = requests
+    return True
+
+
+def send_tencent_sms(destination: str, template_id: str, template_params: list[str] | None = None) -> None:
+    """Send one approved Tencent Cloud SMS template without exposing credentials."""
+    if not tencent_sms_is_configured() or not template_id:
+        raise SmsDeliveryError("短信服务尚未完成配置，请联系平台管理员")
+    timestamp = int(time.time())
+    date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
+    payload = {
+        "PhoneNumberSet": [tencent_sms_phone_number(destination)],
+        "SmsSdkAppId": TENCENT_SMS_APP_ID,
+        "SignName": TENCENT_SMS_SIGN_NAME,
+        "TemplateId": template_id,
+        "TemplateParamSet": template_params or [],
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    hashed_payload = hashlib.sha256(body).hexdigest()
+    canonical_headers = "content-type:application/json; charset=utf-8\nhost:sms.tencentcloudapi.com\n"
+    signed_headers = "content-type;host"
+    canonical_request = f"POST\n/\n\n{canonical_headers}\n{signed_headers}\n{hashed_payload}"
+    credential_scope = f"{date}/sms/tc3_request"
+    string_to_sign = "TC3-HMAC-SHA256\n{}\n{}\n{}".format(
+        timestamp,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    )
+
+    def sign(key: bytes, message: str) -> bytes:
+        return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+    secret_date = sign(("TC3" + TENCENT_SMS_SECRET_KEY).encode("utf-8"), date)
+    secret_service = sign(secret_date, "sms")
+    secret_signing = sign(secret_service, "tc3_request")
+    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        "TC3-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}"
+        .format(TENCENT_SMS_SECRET_ID, credential_scope, signed_headers, signature)
+    )
+    request = Request(
+        "https://sms.tencentcloudapi.com/",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": authorization,
+            "Content-Type": "application/json; charset=utf-8",
+            "Host": "sms.tencentcloudapi.com",
+            "X-TC-Action": "SendSms",
+            "X-TC-Timestamp": str(timestamp),
+            "X-TC-Version": "2021-01-11",
+            "X-TC-Region": TENCENT_SMS_REGION,
+        },
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError):
+        raise SmsDeliveryError("短信发送失败，请稍后重试") from None
+    response_body = result.get("Response") if isinstance(result, dict) else None
+    status = response_body.get("SendStatusSet", [{}])[0] if isinstance(response_body, dict) and response_body.get("SendStatusSet") else {}
+    if response_body.get("Error") or status.get("Code") != "Ok":
+        raise SmsDeliveryError("短信发送失败，请稍后重试")
+
+
+def verification_expiry_minutes(purpose: str) -> int:
+    return 5 if purpose == "admin_step_up" else 2
+
+
 def issue_verification(connection: sqlite3.Connection, user_id: str | None, destination: str, purpose: str) -> str:
     code = f"{secrets.randbelow(900000) + 100000}"
     connection.execute("UPDATE verification_tokens SET consumed_at = CURRENT_TIMESTAMP WHERE destination = ? AND purpose = ? AND consumed_at IS NULL", (destination, purpose))
-    connection.execute("INSERT INTO verification_tokens (id, user_id, destination, purpose, token_hash, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+10 minutes'))", (f"verify-{secrets.token_urlsafe(10)}", user_id, destination, purpose, token_hash(code)))
+    connection.execute("INSERT INTO verification_tokens (id, user_id, destination, purpose, token_hash, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', ?))", (f"verify-{secrets.token_urlsafe(10)}", user_id, destination, purpose, token_hash(code), f"+{verification_expiry_minutes(purpose)} minutes"))
     return code
+
+
+def deliver_verification_code(destination: str, purpose: str, code: str) -> bool:
+    """Deliver a verification code.  Development only exposes a code when SMS is disabled."""
+    if TENCENT_SMS_ENABLED:
+        template_params = [code, "5"] if purpose in {"contact_verify", "password_reset"} else [code]
+        send_tencent_sms(destination, TENCENT_SMS_TEMPLATES.get(purpose, ""), template_params)
+        return True
+    if PRODUCTION_HTTPS:
+        raise SmsDeliveryError("短信服务尚未启用，请联系平台管理员")
+    return False
+
+
+def enqueue_tencent_sms_notification(destination: str, purpose: str) -> None:
+    """Best-effort delivery for approved notification templates.
+
+    Business records and in-site notices must not fail merely because an SMS
+    provider is temporarily unavailable, so notification sends are isolated in
+    a background thread. Verification messages intentionally do not use this
+    helper because their delivery must succeed before a code can be accepted.
+    """
+    template_id = TENCENT_SMS_TEMPLATES.get(purpose, "")
+    if not TENCENT_SMS_ENABLED or not template_id or not str(destination or "").strip():
+        return
+
+    def deliver() -> None:
+        try:
+            send_tencent_sms(destination, template_id)
+        except SmsDeliveryError:
+            # Do not log phone numbers, verification data, or cloud errors.
+            pass
+
+    threading.Thread(target=deliver, daemon=True).start()
 
 
 def consume_verification(connection: sqlite3.Connection, destination: str, purpose: str, code: str) -> sqlite3.Row | None:
@@ -300,11 +828,29 @@ def verify_password(password: str, stored: str) -> tuple[bool, bool]:
     return secrets.compare_digest(password, stored), True
 
 
+def client_ip(handler: BaseHTTPRequestHandler) -> str:
+    """Return the visitor address forwarded by the local reverse proxy.
+
+    The production API binds to 127.0.0.1, so only trust proxy headers when
+    that local proxy is the peer. This avoids letting direct callers spoof an
+    address by adding X-Forwarded-For themselves.
+    """
+    peer_ip = str(getattr(handler, "client_address", ("unknown",))[0])
+    if peer_ip not in {"127.0.0.1", "::1"}:
+        return peer_ip
+    forwarded = handler.headers.get("X-Real-IP", "") or handler.headers.get("X-Forwarded-For", "").rsplit(",", 1)[-1].strip()
+    try:
+        return str(ipaddress.ip_address(forwarded))
+    except ValueError:
+        return peer_ip
+
+
 def login_allowed(client_ip: str) -> bool:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-    failures = [item for item in LOGIN_FAILURES.get(client_ip, []) if item > cutoff]
-    LOGIN_FAILURES[client_ip] = failures
-    return len(failures) < 5
+    with LOGIN_FAILURES_LOCK:
+        failures = [item for item in LOGIN_FAILURES.get(client_ip, []) if item > cutoff]
+        LOGIN_FAILURES[client_ip] = failures
+        return len(failures) < 5
 
 
 def session_cookie(token: str) -> str:
@@ -313,7 +859,13 @@ def session_cookie(token: str) -> str:
 
 
 def register_login_failure(client_ip: str) -> None:
-    LOGIN_FAILURES.setdefault(client_ip, []).append(datetime.now(timezone.utc))
+    with LOGIN_FAILURES_LOCK:
+        LOGIN_FAILURES.setdefault(client_ip, []).append(datetime.now(timezone.utc))
+
+
+def clear_login_failures(client_ip: str) -> None:
+    with LOGIN_FAILURES_LOCK:
+        LOGIN_FAILURES.pop(client_ip, None)
 
 
 def seo_tags(product: dict) -> list[str]:
@@ -327,6 +879,20 @@ def seo_tags(product: dict) -> list[str]:
         tags.append(tag)
     if len(tags) > 12:
         raise ValueError("最多添加 12 个搜索标签")
+    return tags
+
+
+def buyer_seo_tags(product: dict) -> list[str]:
+    tags: list[str] = []
+    for raw_tag in product.get("buyerSeoTags") or []:
+        tag = str(raw_tag).strip().lstrip("#")
+        if not tag or tag in tags:
+            continue
+        if len(tag) > 40:
+            raise ValueError("English search tags can contain up to 40 characters")
+        tags.append(tag)
+    if len(tags) > 12:
+        raise ValueError("You can add up to 12 English search tags")
     return tags
 
 
@@ -356,7 +922,20 @@ def moderation_text(product: dict, title: str, tags: list[str]) -> str:
         f"{variant.get('name') or ''}{''.join(str(value) for value in variant.get('values') or [])}"
         for variant in variants
     )
-    return f"{title}{product.get('description') or ''}{product.get('material') or ''}{''.join(tags)}{variant_text}".lower()
+    return "".join(
+        (
+            title,
+            str(product.get("description") or ""),
+            str(product.get("material") or ""),
+            str(product.get("craftsmanship") or ""),
+            "".join(tags),
+            str(product.get("buyerTitle") or ""),
+            str(product.get("buyerDescription") or ""),
+            str(product.get("buyerMaterial") or ""),
+            "".join(buyer_seo_tags(product)),
+            variant_text,
+        )
+    ).lower()
 
 
 def governance_rule_conditions(rule: sqlite3.Row) -> tuple[list[dict], str]:
@@ -459,21 +1038,113 @@ def decode_media_data_url(value: object, expected_type: str) -> tuple[str, bytes
     return mime_type, binary
 
 
+def create_quarantined_product_media(user_id: str, media_type: str, data: object) -> dict[str, object]:
+    """Accept a local-development upload into private quarantine and verify it."""
+    mime_type, binary = decode_media_data_url(data, media_type)
+    sanitized = sanitise_product_image(binary, mime_type) if media_type == "image" else validate_product_video(binary, mime_type)
+    asset_id = f"asset-{secrets.token_urlsafe(12)}"
+    filename = f"{asset_id}{(IMAGE_MIME_TYPES if media_type == 'image' else VIDEO_MIME_TYPES)[mime_type]}"
+    QUARANTINE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    (QUARANTINE_MEDIA_DIR / filename).write_bytes(sanitized)
+    with database() as connection:
+        connection.execute(
+            """
+            INSERT INTO media_assets (id, uploader_user_id, media_type, mime_type, storage_key, public_url, byte_size, content_hash, verified_at, moderation_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'approved')
+            """,
+            (asset_id, user_id, media_type, mime_type, f"quarantine-local/{filename}", f"/api/seller/media/assets/{asset_id}/preview", len(sanitized), hashlib.sha256(sanitized).hexdigest()),
+        )
+    return {"id": asset_id, "assetId": asset_id, "previewUrl": f"/api/seller/media/assets/{asset_id}/preview", "status": "temporary"}
+
+
+def quarantined_media_bytes(asset: sqlite3.Row) -> bytes:
+    settings = public_cos_settings()
+    storage_key = str(asset["storage_key"])
+    if settings and storage_key.startswith(f"{settings['quarantine_prefix']}/"):
+        return cos_object_bytes(settings, storage_key)
+    filename = Path(storage_key).name
+    path = QUARANTINE_MEDIA_DIR / filename
+    if not path.is_file():
+        raise ValueError("隔离媒体不存在")
+    return path.read_bytes()
+
+
+def promote_product_media_assets(connection: sqlite3.Connection, user_id: str, asset_ids: list[str], *, activate: bool = True, enforce_listing_limits: bool = True) -> list[sqlite3.Row]:
+    """Authorize verified assets, publish them, and return media rows in request order."""
+    if not 1 <= len(asset_ids) <= 11 or len(set(asset_ids)) != len(asset_ids):
+        raise ValueError("商品媒体资产数量或顺序无效")
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = connection.execute(
+        f"SELECT * FROM media_assets WHERE id IN ({placeholders})", tuple(asset_ids)
+    ).fetchall()
+    by_id = {str(row["id"]): row for row in rows}
+    if len(by_id) != len(asset_ids):
+        raise ValueError("商品引用了不存在的媒体资产")
+    ordered = [by_id[asset_id] for asset_id in asset_ids]
+    if any(row["uploader_user_id"] != user_id for row in ordered):
+        raise ValueError("只能引用自己上传的媒体资产")
+    if any(row["status"] not in ("temporary", "active") or row["moderation_status"] != "approved" or not row["verified_at"] for row in ordered):
+        raise ValueError("媒体尚未完成安全校验或审核")
+    images = [row for row in ordered if row["media_type"] == "image"]
+    videos = [row for row in ordered if row["media_type"] == "video"]
+    if enforce_listing_limits and (not 1 <= len(images) <= 10 or len(videos) > 1):
+        raise ValueError("商品需要 1-10 张已审核图片，且最多 1 个视频")
+    settings = public_cos_settings()
+    for row in ordered:
+        if not activate:
+            continue
+        if row["status"] == "active":
+            continue
+        extension = (IMAGE_MIME_TYPES if row["media_type"] == "image" else VIDEO_MIME_TYPES)[row["mime_type"]]
+        filename = f"{row['id']}{extension}"
+        if settings:
+            public_key = f"{settings['prefix']}/{datetime.now(timezone.utc):%Y/%m}/{filename}"
+            content = quarantined_media_bytes(row)
+            try:
+                cos_client(settings).put_object(Bucket=settings["bucket"], Key=public_key, Body=content, ContentType=row["mime_type"], CacheControl="public, max-age=31536000, immutable")
+                cos_client(settings).delete_object(Bucket=settings["bucket"], Key=row["storage_key"])
+            except Exception as error:
+                raise RuntimeError("媒体发布到 CDN 失败") from error
+            storage_key, public_url = public_key, f"{settings['cdn_base_url']}/{public_key}"
+        else:
+            source = QUARANTINE_MEDIA_DIR / Path(row["storage_key"]).name
+            if not source.is_file():
+                raise ValueError("隔离媒体不存在")
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            target = MEDIA_DIR / filename
+            target.write_bytes(source.read_bytes())
+            source.unlink()
+            storage_key, public_url = filename, f"/media/{filename}"
+        connection.execute(
+            "UPDATE media_assets SET storage_key = ?, public_url = ?, status = 'active' WHERE id = ?",
+            (storage_key, public_url, row["id"]),
+        )
+    refreshed = connection.execute(
+        f"SELECT * FROM media_assets WHERE id IN ({placeholders})", tuple(asset_ids)
+    ).fetchall()
+    refreshed_by_id = {str(row["id"]): row for row in refreshed}
+    return [refreshed_by_id[asset_id] for asset_id in asset_ids]
+
+
 def media_storage_key(url: object) -> str | None:
     value = str(url or "")
+    cos_key = public_cos_media_key(value)
+    if cos_key:
+        return cos_key
     marker = "/media/"
     if marker not in value:
         return None
     return Path(value.split(marker, 1)[1].split("?", 1)[0]).name or None
 
 
-def link_media_assets(connection: sqlite3.Connection, urls: list[object], target_type: str, target_id: str) -> None:
+def link_media_assets(connection: sqlite3.Connection, urls: list[object], target_type: str, target_id: str, uploader_user_id: str | None = None) -> None:
     keys = [key for key in (media_storage_key(url) for url in urls) if key]
     if not keys:
         return
     placeholders = ",".join("?" for _ in keys)
+    ownership = " AND uploader_user_id = ?" if uploader_user_id else ""
     assets = connection.execute(
-        f"SELECT id FROM media_assets WHERE storage_key IN ({placeholders}) AND status != 'deleted'", tuple(keys)
+        f"SELECT id FROM media_assets WHERE storage_key IN ({placeholders}) AND status != 'deleted'{ownership}", tuple(keys) + ((uploader_user_id,) if uploader_user_id else tuple())
     ).fetchall()
     for asset in assets:
         connection.execute(
@@ -481,6 +1152,127 @@ def link_media_assets(connection: sqlite3.Connection, urls: list[object], target
             (f"asset-link-{secrets.token_urlsafe(10)}", asset[0], target_type, target_id),
         )
         connection.execute("UPDATE media_assets SET status = 'active' WHERE id = ?", (asset[0],))
+
+
+def record_risk_case(
+    connection: sqlite3.Connection,
+    category: str,
+    severity: str,
+    reason_code: str,
+    *,
+    subject_user_id: str | None = None,
+    order_id: str | None = None,
+    product_id: str | None = None,
+    detail: dict | None = None,
+    fingerprint_parts: tuple[object, ...] = (),
+) -> None:
+    """Create or refresh a deduplicated, reviewable marketplace risk case."""
+    fingerprint_source = "|".join(str(item or "") for item in (category, reason_code, subject_user_id, order_id, product_id, *fingerprint_parts))
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO risk_cases (id, fingerprint, category, severity, subject_user_id, order_id, product_id, reason_code, detail_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(fingerprint) DO UPDATE SET
+          severity = CASE WHEN excluded.severity = 'high' OR risk_cases.severity = 'low' AND excluded.severity = 'medium' THEN excluded.severity ELSE risk_cases.severity END,
+          detail_json = excluded.detail_json,
+          occurrences = risk_cases.occurrences + 1,
+          last_seen_at = CURRENT_TIMESTAMP,
+          status = CASE WHEN risk_cases.status IN ('resolved', 'dismissed') THEN 'open' ELSE risk_cases.status END,
+          resolved_at = NULL, resolved_by_user_id = NULL, resolution_note = NULL
+        """,
+        (
+            f"risk-{secrets.token_urlsafe(10)}", fingerprint, category, severity,
+            subject_user_id, order_id, product_id, reason_code,
+            json.dumps(detail or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def write_after_sale_case_event(
+    connection: sqlite3.Connection,
+    after_sale_id: str,
+    event_type: str,
+    *,
+    actor_user_id: str | None = None,
+    detail: dict | None = None,
+    evidence: list[str] | None = None,
+) -> None:
+    hashes = [hashlib.sha256(item.encode("utf-8")).hexdigest() for item in evidence or []]
+    connection.execute(
+        "INSERT INTO after_sale_case_events (id, after_sale_id, actor_user_id, event_type, detail_json, evidence_hashes_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            f"after-sale-event-{secrets.token_urlsafe(10)}", after_sale_id,
+            actor_user_id, event_type, json.dumps(detail or {}, ensure_ascii=False),
+            json.dumps(hashes, ensure_ascii=False),
+        ),
+    )
+
+
+def record_product_image_fingerprints(connection: sqlite3.Connection, product_id: str, urls: list[object]) -> None:
+    """Record exact binary image hashes and queue matches from different products.
+
+    Exact hashes deliberately flag cases for review instead of auto-unlisting: a maker
+    can legitimately reuse a product image for a variation or a relisted work.
+    """
+    keys = [key for key in (media_storage_key(url) for url in urls) if key]
+    if not keys:
+        return
+    placeholders = ",".join("?" for _ in keys)
+    assets = connection.execute(
+        f"SELECT public_url, content_hash FROM media_assets WHERE storage_key IN ({placeholders}) AND content_hash IS NOT NULL",
+        tuple(keys),
+    ).fetchall()
+    for asset in assets:
+        content_hash = str(asset["content_hash"] or "")
+        if not re.fullmatch(r"[a-f0-9]{64}", content_hash):
+            continue
+        connection.execute(
+            "INSERT OR IGNORE INTO product_image_fingerprints (id, product_id, media_url, content_hash) VALUES (?, ?, ?, ?)",
+            (f"product-image-hash-{secrets.token_urlsafe(10)}", product_id, asset["public_url"], content_hash),
+        )
+        matches = connection.execute(
+            "SELECT product_id, media_url FROM product_image_fingerprints WHERE content_hash = ? AND product_id != ? LIMIT 10",
+            (content_hash, product_id),
+        ).fetchall()
+        for match in matches:
+            pair = tuple(sorted((product_id, str(match["product_id"]))))
+            record_risk_case(
+                connection, "image_duplicate", "medium", "exact_image_hash_match",
+                product_id=product_id,
+                detail={"matchedProductId": match["product_id"], "mediaUrl": asset["public_url"], "matchedMediaUrl": match["media_url"]},
+                fingerprint_parts=(content_hash, *pair),
+            )
+
+
+def risk_cases_payload(connection: sqlite3.Connection) -> list[dict]:
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute(
+        """
+        SELECT risk_cases.*, users.display_name AS subject_name, orders.order_no,
+               products.title AS product_title
+        FROM risk_cases
+        LEFT JOIN users ON users.id = risk_cases.subject_user_id
+        LEFT JOIN orders ON orders.id = risk_cases.order_id
+        LEFT JOIN products ON products.id = risk_cases.product_id
+        ORDER BY CASE risk_cases.status WHEN 'open' THEN 0 WHEN 'reviewing' THEN 1 ELSE 2 END,
+                 CASE risk_cases.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                 risk_cases.last_seen_at DESC
+        LIMIT 200
+        """
+    ).fetchall()
+    return [
+        {
+            "id": row["id"], "category": row["category"], "severity": row["severity"],
+            "status": row["status"], "reasonCode": row["reason_code"],
+            "subjectUserId": row["subject_user_id"], "subject": row["subject_name"],
+            "orderNo": row["order_no"], "productId": row["product_id"],
+            "productTitle": row["product_title"], "detail": json.loads(row["detail_json"] or "{}"),
+            "occurrences": row["occurrences"], "createdAt": row["created_at"],
+            "lastSeenAt": row["last_seen_at"], "resolutionNote": row["resolution_note"],
+        }
+        for row in rows
+    ]
 
 
 def cleanup_temporary_media(connection: sqlite3.Connection) -> int:
@@ -491,28 +1283,193 @@ def cleanup_temporary_media(connection: sqlite3.Connection) -> int:
           AND NOT EXISTS (SELECT 1 FROM media_asset_links WHERE media_asset_links.asset_id = media_assets.id)
         """
     ).fetchall()
+    settings = public_cos_settings()
     for asset_id, storage_key in rows:
-        path = MEDIA_DIR / Path(storage_key).name
-        if not path.is_file():
-            path = LEGACY_MEDIA_DIR / Path(storage_key).name
-        if path.is_file():
-            path.unlink()
+        storage_key = str(storage_key)
+        if settings and storage_key.startswith(f"{settings['quarantine_prefix']}/"):
+            try:
+                cos_client(settings).delete_object(Bucket=settings["bucket"], Key=storage_key)
+            except Exception:
+                # The database marker still prevents a failed/expired upload from
+                # being attached later. A provider lifecycle rule is the final
+                # backstop for an object COS could not delete here.
+                pass
+        elif storage_key.startswith("quarantine-local/"):
+            path = QUARANTINE_MEDIA_DIR / Path(storage_key).name
+            if path.is_file():
+                path.unlink()
+        elif not delete_public_media_from_cos(storage_key):
+            path = MEDIA_DIR / Path(storage_key).name
+            if not path.is_file():
+                path = LEGACY_MEDIA_DIR / Path(storage_key).name
+            if path.is_file():
+                path.unlink()
         connection.execute("UPDATE media_assets SET status = 'deleted', deleted_at = CURRENT_TIMESTAMP WHERE id = ?", (asset_id,))
     return len(rows)
 
 
 def media_rows(product_id: str, product: dict) -> list[tuple]:
+    assets = product.get("_media_assets") or []
+    if assets:
+        return [
+            (f"{product_id}-media-{index}", product_id, row["media_type"], row["storage_key"], row["public_url"], index, int(index == 0 and row["media_type"] == "image"), row["asset_id"] if "asset_id" in row.keys() else row["id"])
+            for index, row in enumerate(assets)
+        ]
     images = product.get("images") or ([product["image"]] if product.get("image") else [])
     rows = [
-        (f"{product_id}-image-{index}", product_id, "image", url, url, index, int(index == 0))
+        (f"{product_id}-image-{index}", product_id, "image", url, url, index, int(index == 0), None)
         for index, url in enumerate(images)
         if url
     ]
     if product.get("video"):
-        rows.append(
-            (f"{product_id}-video", product_id, "video", product["video"], product["video"], len(rows), 0)
-        )
+        rows.append((f"{product_id}-video", product_id, "video", product["video"], product["video"], len(rows), 0, None))
     return rows
+
+
+def resolve_product_media_assets(connection: sqlite3.Connection, user_id: str, product_id: str, product: dict, status: str, existing: bool) -> None:
+    """Replace client URLs with seller-owned, verified asset records."""
+    raw_ids = product.get("mediaAssetIds")
+    asset_ids = [str(value).strip() for value in raw_ids] if isinstance(raw_ids, list) else []
+    if asset_ids:
+        assets = promote_product_media_assets(connection, user_id, asset_ids, activate=status == "published")
+        product["_media_assets"] = assets
+        product["images"] = [row["public_url"] for row in assets if row["media_type"] == "image"]
+        product["image"] = product["images"][0] if product["images"] else ""
+        product["video"] = next((row["public_url"] for row in assets if row["media_type"] == "video"), "")
+        return
+    if existing:
+        current_media = connection.execute(
+            "SELECT id, asset_id, media_type, storage_key, public_url FROM product_media WHERE product_id = ? ORDER BY sort_order",
+            (product_id,),
+        ).fetchall()
+        current_asset_ids = [str(row["asset_id"]) for row in current_media if row["asset_id"]]
+        if status == "published" and current_asset_ids and len(current_asset_ids) == len(current_media):
+            assets = promote_product_media_assets(connection, user_id, current_asset_ids, activate=True)
+            product["_media_assets"] = assets
+            product["images"] = [row["public_url"] for row in assets if row["media_type"] == "image"]
+            product["image"] = product["images"][0] if product["images"] else ""
+            product["video"] = next((row["public_url"] for row in assets if row["media_type"] == "video"), "")
+            return
+        # Legacy listings may retain their historical URL-only media while they
+        # are edited. New media for a listing is always represented by asset ID.
+        if current_asset_ids and len(current_asset_ids) == len(current_media):
+            product["_media_assets"] = current_media
+        product["images"] = [row["public_url"] for row in current_media if row["media_type"] == "image"]
+        product["image"] = product["images"][0] if product["images"] else ""
+        product["video"] = next((row["public_url"] for row in current_media if row["media_type"] == "video"), "")
+        return
+    if status == "published":
+        raise ValueError("新商品只能引用已完成安全审核的媒体资产")
+
+
+def resolve_product_variant_media_assets(connection: sqlite3.Connection, user_id: str, product: dict, status: str) -> None:
+    """Resolve variant thumbnails through the same private asset workflow."""
+    for variant in product.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        asset_ids = variant.get("valueAssetIds")
+        if not isinstance(asset_ids, dict):
+            continue
+        resolved_urls = dict(variant.get("valueImages") or {})
+        for value, asset_id in asset_ids.items():
+            clean_id = str(asset_id or "").strip()
+            if not clean_id:
+                continue
+            asset = promote_product_media_assets(
+                connection, user_id, [clean_id], activate=status == "published", enforce_listing_limits=False
+            )[0]
+            if asset["media_type"] != "image":
+                raise ValueError("Variant media must be an image asset")
+            resolved_urls[str(value)] = asset["public_url"]
+        variant["valueImages"] = resolved_urls
+
+
+def generate_product_code(connection: sqlite3.Connection) -> str:
+    """Return a unique, human-readable eight-character product code."""
+    for _ in range(100):
+        code = "".join(secrets.choice(PRODUCT_CODE_ALPHABET) for _ in range(8))
+        if not connection.execute("SELECT 1 FROM products WHERE product_code = ?", (code,)).fetchone():
+            return code
+    raise RuntimeError("无法生成唯一作品编号")
+
+
+def generate_sku_code(connection: sqlite3.Connection) -> str:
+    """Return a globally unique, merchant-readable SKU code."""
+    for _ in range(100):
+        code = "SKU-" + "".join(secrets.choice(SKU_CODE_ALPHABET) for _ in range(10))
+        if not connection.execute(
+            "SELECT 1 FROM product_skus WHERE sku_code = ? COLLATE NOCASE", (code,)
+        ).fetchone():
+            return code
+    raise RuntimeError("无法生成唯一 SKU 编号")
+
+
+def product_sku_codes(connection: sqlite3.Connection, product_id: str, product: dict) -> tuple[list[dict], str | None]:
+    """Fill blank SKU codes and reject duplicates before replacing a product's SKUs."""
+    skus = product.get("skus") or []
+    supplied_skus = skus if skus else [{}]
+    codes: list[str] = []
+    seen: set[str] = set()
+    for sku in supplied_skus:
+        code = str(sku.get("code") or "").strip()
+        if code:
+            if len(code) > 40:
+                raise ValueError("SKU 编号最多 40 个字符")
+            if re.search(r"[\r\n\t]", code):
+                raise ValueError("SKU 编号不能包含换行或制表符")
+        else:
+            code = generate_sku_code(connection)
+        normalized = code.casefold()
+        if normalized in seen:
+            raise ValueError("SKU 编号在本件作品中不能重复")
+        if connection.execute(
+            "SELECT 1 FROM product_skus WHERE sku_code = ? COLLATE NOCASE AND product_id <> ?",
+            (code, product_id),
+        ).fetchone():
+            raise ValueError("该 SKU 编号已被使用")
+        seen.add(normalized)
+        codes.append(code)
+    for sku, code in zip(skus, codes):
+        sku["code"] = code
+    return skus, None if skus else codes[0]
+
+
+def ensure_product_codes(connection: sqlite3.Connection) -> None:
+    missing = connection.execute(
+        "SELECT id FROM products WHERE product_code IS NULL OR TRIM(product_code) = ''"
+    ).fetchall()
+    for row in missing:
+        product_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        while True:
+            code = generate_product_code(connection)
+            try:
+                connection.execute(
+                    "UPDATE products SET product_code = ? WHERE id = ? AND (product_code IS NULL OR TRIM(product_code) = '')",
+                    (code, product_id),
+                )
+                break
+            except sqlite3.IntegrityError:
+                continue
+
+
+def product_title_units(value: str) -> int:
+    """Count Han characters as 2.5 units and all other characters as one."""
+    return sum(
+        5 if "\u3400" <= character <= "\u4dbf" or "\u4e00" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff" else 2
+        for character in value.strip()
+    )
+
+
+def truncate_product_title(value: str, maximum_units: int = 250) -> str:
+    result = []
+    units = 0
+    for character in value.strip():
+        next_units = 5 if "\u3400" <= character <= "\u4dbf" or "\u4e00" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff" else 2
+        if units + next_units > maximum_units:
+            break
+        result.append(character)
+        units += next_units
+    return "".join(result).strip()
 
 
 def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str, product: dict, status: str) -> None:
@@ -520,8 +1477,20 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
     title = str(product.get("title") or "未命名作品").strip()
     media_urls = product.get("images") or ([product.get("image")] if product.get("image") else [])
     tags = seo_tags(product)
-    if len(title) > 30:
-        raise ValueError("作品名称最多 30 个字")
+    buyer_title = str(product.get("buyerTitle") or "").strip()
+    buyer_description = str(product.get("buyerDescription") or "").strip()
+    buyer_material = str(product.get("buyerMaterial") or "").strip()
+    craftsmanship = str(product.get("craftsmanship") or "").strip()
+    buyer_tags = buyer_seo_tags(product)
+    existing = connection.execute("SELECT product_code FROM products WHERE id = ?", (product_id,)).fetchone()
+    if product_title_units(title) > 250:
+        raise ValueError("作品名称最多 50 个汉字或 125 个英文字符，符号按 1 个字符计")
+    if len(buyer_title) > 140 or len(buyer_description) > 1500 or len(buyer_material) > 300:
+        raise ValueError("English listing copy is too long")
+    if len(craftsmanship) > 300:
+        raise ValueError("制作工艺最多 300 个字")
+    if status == "published" and not existing and not craftsmanship:
+        raise ValueError("请填写制作工艺")
     content = moderation_text(product, title, tags)
     sensitive_word = next((word for word in SENSITIVE_CONTENT_WORDS if word in content), None)
     if sensitive_word:
@@ -533,25 +1502,51 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
         reason = f"命中审核规则“{matched_rule['name']}”"
         write_moderation_log(connection, product_id, content, "rejected", reason)
         raise ValueError(f"内容审核未通过：{reason}")
-    moderation_status = "pending" if matched_rule and matched_rule["action"] == "manual_review" else "approved"
-    moderation_reason = f"命中审核规则“{matched_rule['name']}”，等待人工审核" if moderation_status == "pending" else None
-    effective_status = "draft" if moderation_status == "pending" and status == "published" else status
+    # 卖家发布默认上架。命中人工巡查规则仅记录风险线索，不阻断发布；
+    # 平台如确认违规，再通过治理处置将作品下架。
+    moderation_status = "approved"
+    moderation_reason = None
+    effective_status = status
     if status == "published":
         validate_product_media(product)
     price = int(round(number(product.get("price")) * 100))
+    supplied_currency = str(product.get("currency") or PLATFORM_CURRENCY).upper()
+    if supplied_currency != PLATFORM_CURRENCY:
+        raise ValueError("平台商品价格仅支持 USD")
     stock = max(0, int(number(product.get("stock"))))
+    raw_weight_grams = product.get("weightGrams")
+    weight_grams = None if raw_weight_grams is None or str(raw_weight_grams).strip() == "" else int(round(number(raw_weight_grams)))
+    if weight_grams is not None and not 1 <= weight_grams <= 100000:
+        raise ValueError("商品重量须为 1 至 100000 g 之间的整数")
+    dimensions = str(product.get("dimensions") or "").strip() or None
+    if dimensions is not None and len(dimensions) > 100:
+        raise ValueError("商品尺寸说明最多 100 个字")
     low_stock_threshold = max(0, int(number(product.get("lowStockThreshold", 3))))
     supports_custom = int(bool(product.get("custom")))
+    supplied_code = str(product.get("code") or "").strip().upper()
+    product_code = supplied_code or (existing["product_code"] if existing and existing["product_code"] else generate_product_code(connection))
+    if not re.fullmatch(r"[A-Z0-9]{8}", product_code):
+        raise ValueError("作品编号必须为 8 位字母或数字")
+    skus, default_sku_code = product_sku_codes(connection, product_id, product)
     connection.execute(
         """
-        INSERT INTO products (id, shop_id, category, title, description, material, price_cents, stock, low_stock_threshold, supports_custom, status, published_at, moderation_status, moderation_reason, moderated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'published' THEN CURRENT_TIMESTAMP END, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO products (id, shop_id, product_code, category, title, description, material, craftsmanship, buyer_title, buyer_description, buyer_material, buyer_seo_tags_json, weight_grams, dimensions, price_cents, price_currency, stock, low_stock_threshold, supports_custom, status, published_at, moderation_status, moderation_reason, moderated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'published' THEN CURRENT_TIMESTAMP END, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
+          product_code = COALESCE(products.product_code, excluded.product_code),
           category = excluded.category,
           title = excluded.title,
           description = excluded.description,
           material = excluded.material,
+          craftsmanship = excluded.craftsmanship,
+          buyer_title = excluded.buyer_title,
+          buyer_description = excluded.buyer_description,
+          buyer_material = excluded.buyer_material,
+          buyer_seo_tags_json = excluded.buyer_seo_tags_json,
+          weight_grams = excluded.weight_grams,
+          dimensions = excluded.dimensions,
           price_cents = excluded.price_cents,
+          price_currency = excluded.price_currency,
           stock = excluded.stock,
           low_stock_threshold = excluded.low_stock_threshold,
           supports_custom = excluded.supports_custom,
@@ -565,11 +1560,20 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
         (
             product_id,
             shop_id,
+            product_code,
             product.get("category", "陶艺"),
             title,
             product.get("description") or "",
             product.get("material") or "手工制作",
+            craftsmanship,
+            buyer_title,
+            buyer_description,
+            buyer_material,
+            json.dumps(buyer_tags, ensure_ascii=False),
+            weight_grams,
+            dimensions,
             price,
+            PLATFORM_CURRENCY,
             stock,
             low_stock_threshold,
             supports_custom,
@@ -581,8 +1585,8 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
     )
     if matched_rule:
         record_governance_rule_hit(connection, matched_rule, product_id, content)
-    if moderation_status == "approved":
-        write_moderation_log(connection, product_id, content, "approved", None)
+    write_moderation_log(connection, product_id, content, "approved", None)
+    connection.execute("DELETE FROM media_asset_links WHERE target_type IN ('product', 'product_variant') AND target_id = ?", (product_id,))
     connection.execute("DELETE FROM product_media WHERE product_id = ?", (product_id,))
     connection.execute("DELETE FROM product_options WHERE product_id = ?", (product_id,))
     connection.execute("DELETE FROM product_skus WHERE product_id = ?", (product_id,))
@@ -592,10 +1596,21 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
         [(product_id, tag, 1, index) for index, tag in enumerate(tags)],
     )
     connection.executemany(
-        "INSERT INTO product_media (id, product_id, media_type, storage_key, public_url, sort_order, is_cover) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO product_media (id, product_id, media_type, storage_key, public_url, sort_order, is_cover, asset_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         media_rows(product_id, product),
     )
-    link_media_assets(connection, [*media_urls, product.get("video")], "product", product_id)
+    asset_rows = product.get("_media_assets") or []
+    if asset_rows:
+        for asset in asset_rows:
+            asset_id = asset["asset_id"] if "asset_id" in asset.keys() else asset["id"]
+            connection.execute(
+                "INSERT INTO media_asset_links (id, asset_id, target_type, target_id) VALUES (?, ?, 'product', ?)",
+                (f"asset-link-{secrets.token_urlsafe(10)}", asset_id, product_id),
+            )
+    else:
+        link_media_assets(connection, [*media_urls, product.get("video")], "product", product_id)
+    if status == "published":
+        record_product_image_fingerprints(connection, product_id, media_urls)
     option_value_ids: dict[tuple[str, str], str] = {}
     for option_index, variant in enumerate(product.get("variants") or []):
         option_id = f"{product_id}-option-{option_index}"
@@ -604,14 +1619,19 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
             (option_id, product_id, variant.get("name") or "规格", option_index),
         )
         images = variant.get("valueImages") or {}
+        image_asset_ids = variant.get("valueAssetIds") or {}
         for value_index, value in enumerate(variant.get("values") or []):
             value_id = f"{option_id}-value-{value_index}"
             connection.execute(
-                "INSERT INTO product_option_values (id, option_id, value, image_url, sort_order) VALUES (?, ?, ?, ?, ?)",
-                (value_id, option_id, value, images.get(value), value_index),
+                "INSERT INTO product_option_values (id, option_id, value, image_url, asset_id, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+                (value_id, option_id, value, images.get(value), image_asset_ids.get(value), value_index),
             )
+            if image_asset_ids.get(value):
+                connection.execute(
+                    "INSERT INTO media_asset_links (id, asset_id, target_type, target_id) VALUES (?, ?, 'product_variant', ?)",
+                    (f"asset-link-{secrets.token_urlsafe(10)}", image_asset_ids[value], product_id),
+                )
             option_value_ids[(variant.get("name") or "规格", value)] = value_id
-    skus = product.get("skus") or []
     if skus:
         for sku_index, sku in enumerate(skus):
             option_value_ids_json = json.dumps(
@@ -627,7 +1647,7 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
                 (
                     f"{product_id}-sku-{sku_index}",
                     product_id,
-                    str(sku.get("code") or "").strip() or None,
+                    sku["code"],
                     int(round(number(sku.get("price", price / 100)) * 100)),
                     max(0, int(number(sku.get("stock")))),
                     option_value_ids_json,
@@ -636,8 +1656,8 @@ def upsert_product(connection: sqlite3.Connection, product_id: str, shop_id: str
             )
     else:
         connection.execute(
-            "INSERT INTO product_skus (id, product_id, price_cents, stock) VALUES (?, ?, ?, ?)",
-            (f"{product_id}-default-sku", product_id, price, stock),
+            "INSERT INTO product_skus (id, product_id, sku_code, price_cents, stock) VALUES (?, ?, ?, ?, ?)",
+            (f"{product_id}-default-sku", product_id, default_sku_code, price, stock),
         )
     if skus:
         refresh_product_stock(connection, product_id)
@@ -711,16 +1731,26 @@ def migrate(payload: dict, authenticated_user_id: str | None = None) -> dict:
             """,
             (user_id, len(products), len(drafts)),
         )
-        connection.execute(
-            "UPDATE shops SET settings_json = ? WHERE id = ?",
-            (json.dumps({"featuredProductIds": shop.get("featuredProductIds") or []}, ensure_ascii=False), shop_id),
-        )
+        settings_row = connection.execute("SELECT settings_json FROM shops WHERE id = ?", (shop_id,)).fetchone()
+        try:
+            settings = json.loads(settings_row[0] or "{}") if settings_row else {}
+        except json.JSONDecodeError:
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        settings["featuredProductIds"] = featured_product_ids_for_shop(connection, shop_id, shop.get("featuredProductIds"))
+        if isinstance(shop.get("brandSite"), dict):
+            settings["brandSite"] = shop["brandSite"]
+        if isinstance(shop.get("returnPolicy"), dict):
+            settings["returnPolicy"] = shop["returnPolicy"]
+        connection.execute("UPDATE shops SET settings_json = ? WHERE id = ?", (json.dumps(settings, ensure_ascii=False), shop_id))
     return {"products": len(products), "drafts": len(drafts)}
 
 
 def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] = ("published",)) -> list[dict]:
     with database() as connection:
         connection.row_factory = sqlite3.Row
+        ensure_product_codes(connection)
         shop_filter = ""
         params: tuple[object, ...] = tuple(statuses)
         if shop_ids:
@@ -728,7 +1758,8 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
             params += tuple(shop_ids)
         products = connection.execute(
             f"""
-            SELECT products.*, shops.name AS shop_name
+            SELECT products.*, shops.name AS shop_name, shops.location AS shop_location,
+                   shops.shipping_template_json AS shop_shipping_template_json
             FROM products JOIN shops ON shops.id = products.shop_id
             WHERE products.status IN ({','.join('?' for _ in statuses)}){shop_filter}
             ORDER BY products.published_at DESC, products.created_at DESC
@@ -739,7 +1770,7 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
         for product in products:
             legacy_id = catalog_product_number(product["id"])
             media = connection.execute(
-                "SELECT media_type, public_url FROM product_media WHERE product_id = ? ORDER BY sort_order",
+                "SELECT media_type, public_url, asset_id FROM product_media WHERE product_id = ? ORDER BY sort_order",
                 (product["id"],),
             ).fetchall()
             images = [item["public_url"] for item in media if item["media_type"] == "image"]
@@ -752,7 +1783,7 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
             value_lookup = {}
             for option in options:
                 values = connection.execute(
-                    "SELECT id, value, image_url FROM product_option_values WHERE option_id = ? ORDER BY sort_order",
+                    "SELECT id, value, image_url, asset_id FROM product_option_values WHERE option_id = ? ORDER BY sort_order",
                     (option["id"],),
                 ).fetchall()
                 variants.append(
@@ -760,6 +1791,7 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
                         "name": option["name"],
                         "values": [value["value"] for value in values],
                         "valueImages": {value["value"]: value["image_url"] for value in values if value["image_url"]},
+                        "valueAssetIds": {value["value"]: value["asset_id"] for value in values if value["asset_id"]},
                     }
                 )
                 value_lookup.update({value["id"]: (option["name"], value["value"]) for value in values})
@@ -775,6 +1807,7 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
                 }
                 skus.append({
                     "id": sku["id"], "code": sku["sku_code"] or "", "price": sku["price_cents"] / 100,
+                    "currency": product["price_currency"],
                     "optionValues": option_values, "stock": sku["stock"], "status": sku["status"],
                 })
             seo_tags = [
@@ -792,22 +1825,37 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
                 """,
                 (product["id"],),
             ).fetchone()
+            try:
+                shipping_template = normalize_shipping_template(
+                    json.loads(product["shop_shipping_template_json"] or "{}")
+                )
+            except (json.JSONDecodeError, TypeError):
+                shipping_template = normalize_shipping_template({})
             result.append(
                 {
                     "id": legacy_id,
                     "catalogId": product["id"],
+                    "code": product["product_code"] or "",
                     "title": product["title"],
                     "category": product["category"],
                     "price": product["price_cents"] / 100,
+                    "currency": product["price_currency"],
                     "image": images[0] if images else "",
                     "images": images or None,
                     "video": video,
+                    "mediaAssetIds": [item["asset_id"] for item in media if item["asset_id"]],
+                    "imageAssetIds": [item["asset_id"] for item in media if item["media_type"] == "image" and item["asset_id"]],
+                    "videoAssetId": next((item["asset_id"] for item in media if item["media_type"] == "video" and item["asset_id"]), None),
                     "shopId": 99,
                     "analyticsShopId": product["shop_id"],
                     "shop": product["shop_name"],
+                    "shippingOrigin": product["shop_location"] or "",
+                    "shippingTemplate": shipping_template,
                     "rating": round(float(review_summary["average_rating"] or 5), 1),
                     "reviews": review_summary["review_count"],
                     "stock": product["stock"],
+                    "weightGrams": product["weight_grams"],
+                    "dimensions": product["dimensions"],
                     "lowStockThreshold": product["low_stock_threshold"],
                     "tags": ["原创手作"],
                     "seoTags": seo_tags,
@@ -818,6 +1866,11 @@ def catalog(shop_ids: tuple[str, ...] | None = None, statuses: tuple[str, ...] =
                     "custom": bool(product["supports_custom"]),
                     "description": product["description"],
                     "material": product["material"],
+                    "craftsmanship": product["craftsmanship"] or "",
+                    "buyerTitle": product["buyer_title"] or "",
+                    "buyerDescription": product["buyer_description"] or "",
+                    "buyerMaterial": product["buyer_material"] or "",
+                    "buyerSeoTags": json.loads(product["buyer_seo_tags_json"] or "[]"),
                     "variants": variants or None,
                     "skus": skus or None,
                 }
@@ -876,6 +1929,55 @@ def session_token(handler: BaseHTTPRequestHandler) -> str | None:
     return next((part.strip().split("=", 1)[1] for part in cookies.split(";") if part.strip().startswith("handicrafts_session=")), None)
 
 
+def csrf_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def rotate_session_csrf_token(handler: BaseHTTPRequestHandler) -> str | None:
+    """Issue a fresh CSRF token for the active cookie session."""
+    token = session_token(handler)
+    if not token:
+        return None
+    csrf_token = secrets.token_urlsafe(32)
+    with database() as connection:
+        updated = connection.execute(
+            """
+            UPDATE web_sessions
+            SET csrf_token_hash = ?
+            WHERE token = ? AND expires_at > CURRENT_TIMESTAMP
+              AND EXISTS (SELECT 1 FROM users WHERE users.id = web_sessions.user_id AND users.status = 'active')
+            """,
+            (csrf_token_hash(csrf_token), token),
+        ).rowcount
+    return csrf_token if updated else None
+
+
+def valid_session_csrf_token(handler: BaseHTTPRequestHandler) -> bool:
+    """Check the CSRF header against the active cookie session, if any."""
+    token = session_token(handler)
+    if not token:
+        return True
+    supplied = handler.headers.get("X-CSRF-Token", "")
+    if not supplied:
+        return False
+    with database() as connection:
+        row = connection.execute(
+            """
+            SELECT web_sessions.csrf_token_hash
+            FROM web_sessions JOIN users ON users.id = web_sessions.user_id
+            WHERE web_sessions.token = ? AND web_sessions.expires_at > CURRENT_TIMESTAMP
+              AND users.status = 'active'
+            """,
+            (token,),
+        ).fetchone()
+    # A stale cookie is rejected later by the endpoint's normal authentication
+    # check; it is not a live session that needs CSRF coverage.
+    if not row:
+        return True
+    expected = str(row[0] or "")
+    return bool(expected) and hmac.compare_digest(expected, csrf_token_hash(supplied))
+
+
 def session_user(handler: BaseHTTPRequestHandler) -> str | None:
     token = session_token(handler)
     if not token:
@@ -890,17 +1992,18 @@ def session_user(handler: BaseHTTPRequestHandler) -> str | None:
         return row[0] if row else None
 
 
-def create_session(user_id: str, handler: BaseHTTPRequestHandler | None = None) -> str:
+def create_session(user_id: str, handler: BaseHTTPRequestHandler | None = None) -> tuple[str, str]:
     token = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
     expires = (datetime.now(timezone.utc) + timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
     user_agent = handler.headers.get("User-Agent", "")[:300] if handler else ""
     ip_address = handler.client_address[0] if handler else ""
     with database() as connection:
         connection.execute(
-            "INSERT INTO web_sessions (token, id, user_id, expires_at, last_seen_at, user_agent, ip_address) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
-            (token, f"session-{secrets.token_urlsafe(10)}", user_id, expires, user_agent, ip_address),
+            "INSERT INTO web_sessions (token, id, user_id, expires_at, last_seen_at, user_agent, ip_address, csrf_token_hash) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            (token, f"session-{secrets.token_urlsafe(10)}", user_id, expires, user_agent, ip_address, csrf_token_hash(csrf_token)),
         )
-    return token
+    return token, csrf_token
 
 
 def write_login_audit(connection: sqlite3.Connection, identifier: str, success: bool, handler: BaseHTTPRequestHandler, user_id: str | None = None, reason: str | None = None) -> None:
@@ -918,43 +2021,66 @@ def shop_visitors(shop_id: str) -> int:
         return int(row[0]) if row else 0
 
 
-def seller_analytics(user_id: str, days: int) -> dict:
+def seller_analytics(user_id: str, days: int, start_date: str | None = None, end_date: str | None = None) -> dict:
     days = max(1, min(days, 365))
+    today = datetime.now().date()
+    if start_date or end_date:
+        if not start_date or not end_date:
+            raise ValueError("请选择完整的开始和结束日期")
+        try:
+            range_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            range_end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValueError("日期格式无效") from error
+        if range_start > range_end:
+            raise ValueError("开始日期不能晚于结束日期")
+        if range_end > today:
+            raise ValueError("结束日期不能晚于当天")
+        days = (range_end - range_start).days + 1
+        if days > 365:
+            raise ValueError("最多可查看 365 天的数据")
+    else:
+        range_end = today
+        range_start = today - timedelta(days=days - 1)
+    start_at = f"{range_start.isoformat()} 00:00:00"
+    end_at = f"{(range_end + timedelta(days=1)).isoformat()} 00:00:00"
     with database() as connection:
         connection.row_factory = sqlite3.Row
         shop_ids = seller_accessible_shop_ids(connection, user_id, "settings")
         if not shop_ids:
-            return {"days": days, "revenue": 0, "orders": 0, "visitors": 0, "conversionRate": 0, "pendingFulfillment": 0, "refundRate": 0, "lowStock": 0, "hotProducts": []}
+            return {"days": days, "startDate": range_start.isoformat(), "endDate": range_end.isoformat(), "revenue": 0, "orders": 0, "visitors": 0, "conversionRate": 0, "pendingFulfillment": 0, "refundRate": 0, "lowStock": 0, "hotProducts": []}
         marks = ",".join("?" for _ in shop_ids)
         scope = tuple(shop_ids)
-        order_stats = connection.execute(f"SELECT COUNT(*) AS orders, COALESCE(SUM(paid_amount_cents), 0) AS revenue, SUM(CASE WHEN status = 'refunded' THEN 1 ELSE 0 END) AS refunded, SUM(CASE WHEN status = 'pending_fulfillment' THEN 1 ELSE 0 END) AS pending FROM orders WHERE shop_id IN ({marks}) AND placed_at >= datetime('now', ?)", (*scope, f"-{days} days")).fetchone()
-        visitors = connection.execute(f"SELECT COUNT(DISTINCT visitor_key) FROM shop_visit_events WHERE shop_id IN ({marks}) AND visited_on >= date('now', ?)", (*scope, f"-{days} days")).fetchone()[0]
+        order_stats = connection.execute(f"SELECT COUNT(*) AS orders, COALESCE(SUM(paid_amount_cents), 0) AS revenue, SUM(CASE WHEN status = 'refunded' THEN 1 ELSE 0 END) AS refunded, SUM(CASE WHEN status = 'pending_fulfillment' THEN 1 ELSE 0 END) AS pending FROM orders WHERE shop_id IN ({marks}) AND placed_at >= ? AND placed_at < ?", (*scope, start_at, end_at)).fetchone()
+        visitors = connection.execute(f"SELECT COUNT(DISTINCT visitor_key) FROM shop_visit_events WHERE shop_id IN ({marks}) AND visited_on >= ? AND visited_on <= ?", (*scope, range_start.isoformat(), range_end.isoformat())).fetchone()[0]
         low_stock = connection.execute(f"SELECT COUNT(*) FROM products WHERE shop_id IN ({marks}) AND status = 'published' AND stock BETWEEN 1 AND low_stock_threshold", scope).fetchone()[0]
-        hot = connection.execute(f"SELECT products.id, products.title, SUM(order_items.quantity) AS sales FROM order_items JOIN orders ON orders.id = order_items.order_id JOIN products ON products.id = order_items.product_id WHERE orders.shop_id IN ({marks}) AND orders.status NOT IN ('cancelled', 'refunded') AND orders.placed_at >= datetime('now', ?) GROUP BY products.id ORDER BY sales DESC LIMIT 5", (*scope, f"-{days} days")).fetchall()
+        hot = connection.execute(f"SELECT products.id, products.title, SUM(order_items.quantity) AS sales FROM order_items JOIN orders ON orders.id = order_items.order_id JOIN products ON products.id = order_items.product_id WHERE orders.shop_id IN ({marks}) AND orders.status NOT IN ('cancelled', 'refunded') AND orders.placed_at >= ? AND orders.placed_at < ? GROUP BY products.id ORDER BY sales DESC LIMIT 5", (*scope, start_at, end_at)).fetchall()
         count = int(order_stats["orders"] or 0)
-        return {"days": days, "revenue": order_stats["revenue"] / 100, "orders": count, "visitors": visitors, "conversionRate": round(count / visitors * 100, 2) if visitors else 0, "pendingFulfillment": int(order_stats["pending"] or 0), "refundRate": round(int(order_stats["refunded"] or 0) / count * 100, 2) if count else 0, "lowStock": low_stock, "hotProducts": [{"id": row["id"], "title": row["title"], "sales": row["sales"]} for row in hot]}
+        return {"days": days, "startDate": range_start.isoformat(), "endDate": range_end.isoformat(), "revenue": order_stats["revenue"] / 100, "orders": count, "visitors": visitors, "conversionRate": round(count / visitors * 100, 2) if visitors else 0, "pendingFulfillment": int(order_stats["pending"] or 0), "refundRate": round(int(order_stats["refunded"] or 0) / count * 100, 2) if count else 0, "lowStock": low_stock, "hotProducts": [{"id": row["id"], "title": row["title"], "sales": row["sales"]} for row in hot]}
 
 
 def platform_analytics(days: int) -> dict:
     days = max(1, min(days, 365))
+    period_start = "start of day" if days == 1 else f"-{days} days"
+    daily_start = "start of day" if days == 1 else f"-{days - 1} days"
     with database() as connection:
         connection.row_factory = sqlite3.Row
-        orders = connection.execute("SELECT COALESCE(SUM(paid_amount_cents), 0) AS revenue, COUNT(*) AS total FROM orders WHERE paid_at >= datetime('now', ?) AND status NOT IN ('cancelled', 'refunded', 'pending_payment')", (f"-{days} days",)).fetchone()
-        statuses = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM orders WHERE placed_at >= datetime('now', ?) GROUP BY status", (f"-{days} days",))}
-        active_shops = connection.execute("SELECT COUNT(DISTINCT shop_id) FROM orders WHERE paid_at >= datetime('now', ?) AND status NOT IN ('cancelled', 'refunded', 'pending_payment')", (f"-{days} days",)).fetchone()[0]
+        orders = connection.execute("SELECT COALESCE(SUM(paid_amount_cents), 0) AS revenue, COUNT(*) AS total FROM orders WHERE paid_at >= datetime('now', ?) AND status NOT IN ('cancelled', 'refunded', 'pending_payment')", (period_start,)).fetchone()
+        statuses = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM orders WHERE placed_at >= datetime('now', ?) GROUP BY status", (period_start,))}
+        active_shops = connection.execute("SELECT COUNT(DISTINCT shop_id) FROM orders WHERE paid_at >= datetime('now', ?) AND status NOT IN ('cancelled', 'refunded', 'pending_payment')", (period_start,)).fetchone()[0]
         pending_reports = connection.execute("SELECT COUNT(*) FROM content_reports WHERE status = 'pending'").fetchone()[0]
         pending_appeals = connection.execute("SELECT COUNT(*) FROM governance_appeals WHERE status = 'pending'").fetchone()[0]
-        timing = connection.execute("SELECT AVG((julianday(handled_at) - julianday(created_at)) * 24) FROM governance_appeals WHERE status IN ('approved', 'rejected') AND handled_at IS NOT NULL AND created_at >= datetime('now', ?)", (f"-{days} days",)).fetchone()[0]
-        daily_rows = connection.execute("SELECT date(paid_at) AS day, COALESCE(SUM(paid_amount_cents), 0) AS revenue, COUNT(*) AS orders FROM orders WHERE paid_at >= datetime('now', ?) AND status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY date(paid_at)", (f"-{days - 1} days",)).fetchall()
+        timing = connection.execute("SELECT AVG((julianday(handled_at) - julianday(created_at)) * 24) FROM governance_appeals WHERE status IN ('approved', 'rejected') AND handled_at IS NOT NULL AND created_at >= datetime('now', ?)", (period_start,)).fetchone()[0]
+        daily_rows = connection.execute("SELECT date(paid_at) AS day, COALESCE(SUM(paid_amount_cents), 0) AS revenue, COUNT(*) AS orders FROM orders WHERE paid_at >= datetime('now', ?) AND status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY date(paid_at)", (daily_start,)).fetchall()
         daily_lookup = {row["day"]: {"revenue": row["revenue"] / 100, "orders": row["orders"]} for row in daily_rows}
         daily = []
         for offset in range(days - 1, -1, -1):
             day = (datetime.now().date() - timedelta(days=offset)).isoformat()
             daily.append({"date": day, **daily_lookup.get(day, {"revenue": 0, "orders": 0})})
-        categories = connection.execute("SELECT products.category, COUNT(order_items.id) AS sales, COALESCE(SUM(order_items.subtotal_cents), 0) AS revenue FROM order_items JOIN orders ON orders.id = order_items.order_id JOIN products ON products.id = order_items.product_id WHERE orders.paid_at >= datetime('now', ?) AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY products.category ORDER BY revenue DESC LIMIT 6", (f"-{days} days",)).fetchall()
-        shops = connection.execute("SELECT shops.name, COUNT(orders.id) AS orders, COALESCE(SUM(orders.paid_amount_cents), 0) AS revenue FROM orders JOIN shops ON shops.id = orders.shop_id WHERE orders.paid_at >= datetime('now', ?) AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY shops.id ORDER BY revenue DESC LIMIT 5", (f"-{days} days",)).fetchall()
+        categories = connection.execute("SELECT products.category, COUNT(order_items.id) AS sales, COALESCE(SUM(order_items.subtotal_cents), 0) AS revenue FROM order_items JOIN orders ON orders.id = order_items.order_id JOIN products ON products.id = order_items.product_id WHERE orders.paid_at >= datetime('now', ?) AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY products.category ORDER BY revenue DESC LIMIT 6", (period_start,)).fetchall()
+        shops = connection.execute("SELECT shops.name, COUNT(orders.id) AS orders, COALESCE(SUM(orders.paid_amount_cents), 0) AS revenue FROM orders JOIN shops ON shops.id = orders.shop_id WHERE orders.paid_at >= datetime('now', ?) AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY shops.id ORDER BY revenue DESC LIMIT 5", (period_start,)).fetchall()
         active_campaigns = connection.execute("SELECT COUNT(*) FROM platform_campaigns WHERE status = 'active' AND (starts_at IS NULL OR starts_at <= CURRENT_TIMESTAMP) AND (ends_at IS NULL OR ends_at > CURRENT_TIMESTAMP)").fetchone()[0]
-        event_scope = (f"-{days} days",)
+        event_scope = (period_start,)
         funnel = connection.execute(
             """
             WITH actors AS (
@@ -995,7 +2121,33 @@ def platform_analytics(days: int) -> dict:
         fulfillment = connection.execute("SELECT AVG((julianday(shipments.shipped_at) - julianday(orders.paid_at)) * 24) FROM shipments JOIN orders ON orders.id = shipments.order_id WHERE orders.paid_at >= datetime('now', ?) AND orders.paid_at IS NOT NULL", event_scope).fetchone()[0]
         new_customers = connection.execute("SELECT COUNT(*) FROM (SELECT buyer_user_id FROM orders WHERE status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY buyer_user_id HAVING MIN(paid_at) >= datetime('now', ?))", event_scope).fetchone()[0]
         product_views = {row["product_id"]: row["views"] for row in connection.execute("SELECT product_id, COUNT(DISTINCT COALESCE(user_id, visitor_key)) AS views FROM analytics_events WHERE event_type = 'product_view' AND product_id IS NOT NULL AND created_at >= datetime('now', ?) GROUP BY product_id", event_scope)}
-        products = connection.execute("SELECT products.id, products.title, COALESCE(SUM(CASE WHEN orders.id IS NOT NULL THEN order_items.quantity ELSE 0 END), 0) AS sales, COALESCE(SUM(CASE WHEN orders.id IS NOT NULL THEN order_items.subtotal_cents ELSE 0 END), 0) AS revenue FROM products LEFT JOIN order_items ON order_items.product_id = products.id LEFT JOIN orders ON orders.id = order_items.order_id AND orders.paid_at >= datetime('now', ?) AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment') GROUP BY products.id ORDER BY revenue DESC LIMIT 6", event_scope).fetchall()
+        products = connection.execute(
+            """
+            SELECT products.id, products.title,
+              COALESCE(sales.sales, 0) AS sales,
+              COALESCE(sales.revenue, 0) AS revenue,
+              COALESCE(views.views, 0) AS views
+            FROM products
+            LEFT JOIN (
+              SELECT order_items.product_id, SUM(order_items.quantity) AS sales,
+                SUM(order_items.subtotal_cents) AS revenue
+              FROM order_items JOIN orders ON orders.id = order_items.order_id
+              WHERE orders.paid_at >= datetime('now', ?)
+                AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment')
+              GROUP BY order_items.product_id
+            ) AS sales ON sales.product_id = products.id
+            LEFT JOIN (
+              SELECT product_id, COUNT(DISTINCT COALESCE(user_id, visitor_key)) AS views
+              FROM analytics_events
+              WHERE event_type = 'product_view' AND product_id IS NOT NULL
+                AND created_at >= datetime('now', ?)
+              GROUP BY product_id
+            ) AS views ON views.product_id = products.id
+            ORDER BY sales.sales DESC, views.views DESC, sales.revenue DESC, products.created_at DESC
+            LIMIT 6
+            """,
+            (period_start, period_start),
+        ).fetchall()
         product_performance = [{"id": row["id"], "title": row["title"], "views": int(product_views.get(row["id"], 0)), "sales": int(row["sales"]), "revenue": row["revenue"] / 100, "conversionRate": round(int(row["sales"]) / product_views[row["id"]] * 100, 2) if product_views.get(row["id"]) else 0} for row in products]
         paid_order_count = int(paid_stats["orders"] or 0)
         repeat_buyers = int(repeat_stats["buyers"] or 0)
@@ -1041,8 +2193,453 @@ def analytics_channel(value: object) -> str:
     return channel or "direct"
 
 
-def record_analytics_event(connection: sqlite3.Connection, event_type: str, visitor_key: str | None = None, user_id: str | None = None, shop_id: str | None = None, product_id: str | None = None, campaign_id: str | None = None, channel: object = "direct") -> None:
-    connection.execute("INSERT INTO analytics_events (id, event_type, visitor_key, user_id, shop_id, product_id, campaign_id, channel) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (f"analytics-{secrets.token_urlsafe(10)}", event_type, visitor_key or None, user_id, shop_id, product_id, campaign_id, analytics_channel(channel)))
+ANALYTICS_EVENT_TYPES = {
+    "product_view", "add_cart", "checkout_started", "order_paid",
+    "product_impression", "product_click", "favorite_added",
+}
+ANALYTICS_PRODUCT_EVENT_TYPES = {"product_view", "product_impression", "product_click", "favorite_added"}
+MAX_ANALYTICS_EVENT_BATCH = 50
+
+
+def analytics_placement(value: object) -> str:
+    placement = str(value or "unknown").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,64}", placement):
+        raise ValueError("Invalid analytics placement")
+    return placement
+
+
+def analytics_visitor_key(value: object, required: bool = False) -> str | None:
+    visitor_key = str(value or "").strip()
+    if not visitor_key:
+        if required:
+            raise ValueError("Missing visitor key")
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{6,128}", visitor_key):
+        raise ValueError("Invalid visitor key")
+    return visitor_key
+
+
+def analytics_event_id(value: object) -> str:
+    event_id = str(value or "").strip()
+    if event_id:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{6,128}", event_id):
+            raise ValueError("Invalid analytics event id")
+        return event_id
+    return f"analytics-{secrets.token_urlsafe(16)}"
+
+
+def record_analytics_event(connection: sqlite3.Connection, event_type: str, visitor_key: str | None = None, user_id: str | None = None, shop_id: str | None = None, product_id: str | None = None, campaign_id: str | None = None, channel: object = "direct", placement: object = "unknown", event_id: object = None) -> bool:
+    if event_type not in ANALYTICS_EVENT_TYPES:
+        raise ValueError("Invalid analytics event")
+    inserted = connection.execute(
+        "INSERT OR IGNORE INTO analytics_events (id, event_type, visitor_key, user_id, shop_id, product_id, campaign_id, channel, placement) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (analytics_event_id(event_id), event_type, analytics_visitor_key(visitor_key), user_id, shop_id, product_id, campaign_id, analytics_channel(channel), analytics_placement(placement)),
+    ).rowcount
+    return bool(inserted)
+
+
+def record_public_analytics_events(connection: sqlite3.Connection, events: object, user_id: str | None = None) -> tuple[int, int]:
+    if not isinstance(events, list) or not events or len(events) > MAX_ANALYTICS_EVENT_BATCH:
+        raise ValueError("Invalid analytics event batch")
+    accepted = duplicates = 0
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("Invalid analytics event")
+        event_type = str(event.get("type") or event.get("eventType") or "")
+        if event_type not in ANALYTICS_PRODUCT_EVENT_TYPES:
+            raise ValueError("Invalid analytics event")
+        # Favorites are sourced from the authenticated favorite action below;
+        # accepting them here would allow clients to fabricate favorite signals.
+        if event_type == "favorite_added":
+            raise ValueError("Favorite events are server recorded")
+        product_id = str(event.get("productId") or "").strip()
+        if not product_id or len(product_id) > 128:
+            raise ValueError("Invalid product")
+        visitor_key = analytics_visitor_key(event.get("visitorKey"), required=not user_id)
+        product = connection.execute(
+            "SELECT shop_id FROM products WHERE id = ? AND status = 'published'", (product_id,)
+        ).fetchone()
+        if not product:
+            raise ValueError("Product not found")
+        if record_analytics_event(
+            connection, event_type, visitor_key=visitor_key, user_id=user_id,
+            shop_id=product[0], product_id=product_id, channel=event.get("channel"),
+            placement=event.get("placement") or "unknown", event_id=event.get("eventId"),
+        ):
+            accepted += 1
+        else:
+            duplicates += 1
+    return accepted, duplicates
+
+
+def _business_metric_period(connection: sqlite3.Connection, shop_ids: list[str], start_at: str, end_at: str) -> dict:
+    marks = ",".join("?" for _ in shop_ids)
+    scope = tuple(shop_ids)
+    event_rows = connection.execute(
+        f"""
+        SELECT event_type, COUNT(DISTINCT COALESCE(user_id, visitor_key)) AS actors
+        FROM analytics_events
+        WHERE shop_id IN ({marks}) AND created_at >= ? AND created_at < ?
+          AND COALESCE(user_id, visitor_key) IS NOT NULL
+        GROUP BY event_type
+        """, (*scope, start_at, end_at)
+    ).fetchall()
+    event_counts = {row["event_type"]: int(row["actors"] or 0) for row in event_rows}
+    order = connection.execute(
+        f"""
+        SELECT COUNT(DISTINCT orders.id) AS orders, COALESCE(SUM(order_items.subtotal_cents), 0) AS revenue
+        FROM order_items JOIN orders ON orders.id = order_items.order_id
+        WHERE orders.shop_id IN ({marks}) AND orders.paid_at IS NOT NULL
+          AND orders.status NOT IN ('cancelled', 'refunded')
+          AND orders.paid_at >= ? AND orders.paid_at < ?
+        """, (*scope, start_at, end_at)
+    ).fetchone()
+    impressions = event_counts.get("product_impression", 0)
+    clicks = event_counts.get("product_click", 0) + event_counts.get("product_view", 0)
+    favorites = event_counts.get("favorite_added", 0)
+    add_carts = event_counts.get("add_cart", 0)
+    orders = int(order["orders"] or 0)
+    return {
+        "impressions": impressions, "clicks": clicks, "favorites": favorites,
+        "addCarts": add_carts, "orders": orders, "revenue": round((order["revenue"] or 0) / 100, 2),
+        "clickThroughRate": round(clicks / impressions * 100, 2) if impressions else 0,
+        "favoriteRate": round(favorites / clicks * 100, 2) if clicks else 0,
+        "addCartRate": round(add_carts / clicks * 100, 2) if clicks else 0,
+        "conversionRate": round(orders / clicks * 100, 2) if clicks else 0,
+    }
+
+
+def business_metric_aliases(metrics: dict) -> dict:
+    """Keep the first dashboard's naming contract alongside readable metrics."""
+    return {
+        **metrics,
+        "exposureUv": metrics["impressions"],
+        "clickUv": metrics["clicks"],
+        "favoriteAdds": metrics["favorites"],
+        "addCartUv": metrics["addCarts"],
+        "ctr": metrics["clickThroughRate"],
+        "clickToOrderRate": metrics["conversionRate"],
+    }
+
+
+def seller_business_analytics(user_id: str, days: int) -> dict:
+    if days not in (1, 7, 30):
+        raise ValueError("days must be one of 1, 7, or 30")
+    today = datetime.now().date()
+    current_start = today - timedelta(days=days - 1)
+    current_end = today + timedelta(days=1)
+    previous_start = current_start - timedelta(days=days)
+    previous_end = current_start
+    with database() as connection:
+        connection.row_factory = sqlite3.Row
+        shop_ids = seller_accessible_shop_ids(connection, user_id, "settings")
+        period = {
+            "current": {"startDate": current_start.isoformat(), "endDate": today.isoformat()},
+            "previous": {"startDate": previous_start.isoformat(), "endDate": (current_start - timedelta(days=1)).isoformat()},
+        }
+        if not shop_ids:
+            empty = _business_metric_period(connection, [], "", "") if False else {"impressions": 0, "clicks": 0, "favorites": 0, "addCarts": 0, "orders": 0, "revenue": 0, "clickThroughRate": 0, "favoriteRate": 0, "addCartRate": 0, "conversionRate": 0}
+            empty = business_metric_aliases(empty)
+            empty_funnel = {"impressions": 0, "clicks": 0, "favorites": 0, "addCarts": 0, "paidOrders": 0, "clickRate": 0, "favoriteRate": 0, "addCartRate": 0, "paymentRate": 0, "exposureUv": 0, "clickUv": 0, "favoriteAdds": 0, "addCartUv": 0, "ctr": 0, "clickToOrderRate": 0}
+            empty_current = {**period["current"], "overview": empty, "funnel": empty_funnel, "products": [], "insights": []}
+            empty_previous = {**period["previous"], "overview": empty}
+            return {"days": days, "current": empty_current, "previous": empty_previous, "overview": {**empty, "compare": {key: None for key in empty}}, "funnel": empty_funnel, "products": [], "insights": []}
+        current = business_metric_aliases(_business_metric_period(connection, shop_ids, f"{current_start.isoformat()} 00:00:00", f"{current_end.isoformat()} 00:00:00"))
+        previous = business_metric_aliases(_business_metric_period(connection, shop_ids, f"{previous_start.isoformat()} 00:00:00", f"{previous_end.isoformat()} 00:00:00"))
+        compare = {
+            key: round(current[key] - previous[key], 2) if previous[key] else (None if not current[key] else None)
+            for key in current
+        }
+        # Rates are reported as percentage-point deltas; count and revenue values
+        # intentionally use absolute deltas so a zero prior period remains useful.
+        for key in ("impressions", "clicks", "favorites", "addCarts", "orders", "revenue"):
+            compare[key] = round(current[key] - previous[key], 2)
+        marks = ",".join("?" for _ in shop_ids)
+        scope = tuple(shop_ids)
+        products = connection.execute(
+            f"""
+            SELECT products.id, products.title, products.stock, products.low_stock_threshold, products.published_at,
+              COALESCE(events.impressions, 0) AS impressions,
+              COALESCE(events.clicks, 0) AS clicks,
+              COALESCE(events.favorites, 0) AS favorites,
+              COALESCE(events.add_carts, 0) AS add_carts,
+              COALESCE(sales.orders, 0) AS orders,
+              COALESCE(sales.revenue, 0) AS revenue
+            FROM products
+            LEFT JOIN (
+              SELECT product_id,
+                COUNT(DISTINCT CASE WHEN event_type = 'product_impression' THEN COALESCE(user_id, visitor_key) END) AS impressions,
+                COUNT(DISTINCT CASE WHEN event_type IN ('product_click', 'product_view') THEN COALESCE(user_id, visitor_key) END) AS clicks,
+                COUNT(DISTINCT CASE WHEN event_type = 'favorite_added' THEN COALESCE(user_id, visitor_key) END) AS favorites,
+                COUNT(DISTINCT CASE WHEN event_type = 'add_cart' THEN COALESCE(user_id, visitor_key) END) AS add_carts
+              FROM analytics_events
+              WHERE shop_id IN ({marks}) AND created_at >= ? AND created_at < ?
+              GROUP BY product_id
+            ) events ON events.product_id = products.id
+            LEFT JOIN (
+              SELECT order_items.product_id, COUNT(DISTINCT orders.id) AS orders,
+                SUM(order_items.subtotal_cents) AS revenue
+              FROM order_items JOIN orders ON orders.id = order_items.order_id
+              WHERE orders.shop_id IN ({marks}) AND orders.paid_at IS NOT NULL
+                AND orders.status NOT IN ('cancelled', 'refunded')
+                AND orders.paid_at >= ? AND orders.paid_at < ?
+              GROUP BY order_items.product_id
+            ) sales ON sales.product_id = products.id
+            WHERE products.shop_id IN ({marks}) AND products.status = 'published'
+            ORDER BY orders DESC, clicks DESC, impressions DESC, products.updated_at DESC
+            """,
+            (*scope, f"{current_start.isoformat()} 00:00:00", f"{current_end.isoformat()} 00:00:00", *scope, f"{current_start.isoformat()} 00:00:00", f"{current_end.isoformat()} 00:00:00", *scope),
+        ).fetchall()
+        product_rows = [{
+            "id": row["id"], "title": row["title"], "stock": int(row["stock"] or 0),
+            "lowStockThreshold": int(row["low_stock_threshold"] or 0), "publishedAt": row["published_at"],
+            "impressions": int(row["impressions"] or 0), "clicks": int(row["clicks"] or 0),
+            "favorites": int(row["favorites"] or 0), "addCarts": int(row["add_carts"] or 0),
+            "orders": int(row["orders"] or 0), "revenue": round((row["revenue"] or 0) / 100, 2),
+            "clickThroughRate": round((row["clicks"] or 0) / (row["impressions"] or 1) * 100, 2) if row["impressions"] else 0,
+            "conversionRate": round((row["orders"] or 0) / (row["clicks"] or 1) * 100, 2) if row["clicks"] else 0,
+            "exposureUv": int(row["impressions"] or 0), "clickUv": int(row["clicks"] or 0),
+            "favoriteAdds": int(row["favorites"] or 0),
+            "addCartUv": int(row["add_carts"] or 0),
+            "ctr": round((row["clicks"] or 0) / (row["impressions"] or 1) * 100, 2) if row["impressions"] else 0,
+            "clickToOrderRate": round((row["orders"] or 0) / (row["clicks"] or 1) * 100, 2) if row["clicks"] else 0,
+        } for row in products]
+        funnel = {"impressions": current["impressions"], "clicks": current["clicks"], "favorites": current["favorites"], "addCarts": current["addCarts"], "paidOrders": current["orders"], "clickRate": current["clickThroughRate"], "favoriteRate": current["favoriteRate"], "addCartRate": current["addCartRate"], "paymentRate": current["conversionRate"], "exposureUv": current["exposureUv"], "clickUv": current["clickUv"], "favoriteAdds": current["favoriteAdds"], "addCartUv": current["addCartUv"], "ctr": current["ctr"], "clickToOrderRate": current["clickToOrderRate"]}
+        payload = {
+            "days": days,
+            "current": {**period["current"], "overview": current, "funnel": funnel, "products": product_rows},
+            "previous": {**period["previous"], "overview": previous},
+            "overview": {**current, "compare": compare}, "funnel": funnel, "products": product_rows,
+        }
+        try:
+            from business_advisor import build_insights
+            insights = build_insights(payload)
+        except ImportError:
+            insights = []
+        normalised_insights = []
+        for insight in insights if isinstance(insights, list) else []:
+            if not isinstance(insight, dict):
+                continue
+            target = insight.get("actionTab") or insight.get("actionTarget") or "products"
+            if target not in ("products", "promotions", "inventory"):
+                target = "products"
+            reason = str(insight.get("reason") or insight.get("description") or "")
+            normalised_insights.append({
+                **insight, "actionTab": target, "actionTarget": target,
+                "description": str(insight.get("description") or reason),
+                "recommendation": str(insight.get("recommendation") or insight.get("suggestion") or reason),
+                "suggestion": str(insight.get("suggestion") or insight.get("recommendation") or reason),
+                "actionLabel": str(insight.get("actionLabel") or "View details"),
+            })
+        payload["insights"] = normalised_insights
+        payload["current"]["insights"] = normalised_insights
+        return payload
+
+
+def seller_ai_assistant_rate_allowed(user_id: str, limit: int = 20, window_seconds: int = 600) -> bool:
+    """Atomically reserve an AI request quota across server processes.
+
+    SQLite is the shared coordination point for this deployment.  An immediate
+    write transaction prevents two HTTP worker threads (or processes) from both
+    seeing the last remaining slot and admitting more than ``limit`` requests.
+    """
+    if not user_id or limit < 1 or window_seconds < 1:
+        return False
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "DELETE FROM ai_rate_limit_events WHERE created_at <= datetime('now', ?)",
+            (f"-{int(window_seconds)} seconds",),
+        )
+        used = connection.execute(
+            "SELECT COUNT(*) FROM ai_rate_limit_events WHERE user_id = ? AND scope = 'seller_ai'",
+            (user_id,),
+        ).fetchone()[0]
+        if used >= limit:
+            return False
+        connection.execute(
+            "INSERT INTO ai_rate_limit_events (user_id, scope) VALUES (?, 'seller_ai')",
+            (user_id,),
+        )
+    return True
+
+
+def seller_ai_assistant_endpoint() -> str:
+    if not OPENAI_BASE_URL:
+        raise ValueError("AI 服务尚未配置，请联系平台管理员设置 OPENAI_BASE_URL")
+    if OPENAI_BASE_URL.endswith("/chat/completions"):
+        return OPENAI_BASE_URL
+    return f"{OPENAI_BASE_URL if OPENAI_BASE_URL.endswith('/v1') else f'{OPENAI_BASE_URL}/v1'}/chat/completions"
+
+
+def seller_ai_title_endpoint() -> str:
+    if not VISION_BASE_URL:
+        raise ValueError("图片标题服务尚未配置，请设置 VISION_BASE_URL")
+    if VISION_BASE_URL.endswith("/chat/completions"):
+        return VISION_BASE_URL
+    return f"{VISION_BASE_URL if VISION_BASE_URL.endswith('/v1') else f'{VISION_BASE_URL}/v1'}/chat/completions"
+
+
+def seller_ai_assistant_reply(user_id: str, message: object, history: object) -> str:
+    question = str(message or "").strip()
+    if not 1 <= len(question) <= 2000:
+        raise ValueError("请输入 1 到 2000 个字符的问题")
+    if not OPENAI_API_KEY:
+        raise ValueError("AI 服务尚未配置，请联系平台管理员设置 OPENAI_API_KEY")
+    if not seller_ai_assistant_rate_allowed(user_id):
+        raise ValueError("提问过于频繁，请 10 分钟后再试")
+
+    safe_history = []
+    for item in history[-8:] if isinstance(history, list) else []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        content = str(item.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            safe_history.append({"role": role, "content": content[:2000]})
+
+    analytics = seller_business_analytics(user_id, 30)
+    overview = analytics.get("overview") or {}
+    context = {
+        "period": "最近30天",
+        "overview": {
+            key: overview.get(key, 0)
+            for key in ("impressions", "clicks", "favorites", "addCarts", "orders", "revenue", "clickThroughRate", "conversionRate")
+        },
+        "insights": [
+            {
+                "title": item.get("title", ""),
+                "description": item.get("description", ""),
+                "recommendation": item.get("recommendation", ""),
+            }
+            for item in (analytics.get("insights") or [])[:5]
+            if isinstance(item, dict)
+        ],
+        "products": [
+            {
+                key: product.get(key, 0)
+                for key in ("title", "impressions", "clicks", "favorites", "addCarts", "orders", "revenue", "clickThroughRate", "conversionRate", "stock")
+            }
+            for product in (analytics.get("products") or [])[:8]
+            if isinstance(product, dict)
+        ],
+    }
+    system_prompt = """你是手作集卖家后台的 AI 运营助手。只基于提供的店铺数据回答，帮助卖家提升曝光、点击、收藏、加购和订单。回答使用简体中文，先给结论，再给不超过 3 条可执行措施；使用 Markdown 加粗每个小节标题，例如 **结论：**、**可执行措施：**。数据不足时明确说明，不能编造业绩、平台规则或执行结果。不要索取或输出支付、身份等敏感信息。"""
+    request_body = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.4,
+        "max_tokens": 900,
+        "messages": [
+            {"role": "system", "content": f"{system_prompt}\n\n店铺经营数据：\n{json.dumps(context, ensure_ascii=False)}"},
+            *safe_history,
+            {"role": "user", "content": question},
+        ],
+    }
+    request = Request(
+        seller_ai_assistant_endpoint(),
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise ValueError("AI 服务暂时无法响应，请稍后重试") from error
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    content = choices[0].get("message", {}).get("content") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else ""
+    if isinstance(content, list):
+        content = "".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
+    reply = str(content or "").strip()
+    if not reply:
+        raise ValueError("AI 服务未返回有效内容，请稍后重试")
+    return reply[:8000]
+
+
+def seller_ai_product_title(user_id: str, image_data: object) -> dict[str, str]:
+    """Generate editable English and Chinese product titles from an uploaded image."""
+    if not VISION_API_KEY:
+        raise ValueError("图片标题服务尚未配置，请设置 VISION_API_KEY")
+    if not seller_ai_assistant_rate_allowed(user_id):
+        raise ValueError("标题生成过于频繁，请 10 分钟后再试")
+
+    source_image = str(image_data or "").strip()
+    matched = re.fullmatch(r"data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)", source_image)
+    if not matched:
+        raise ValueError("图片标题请求无效，请重新上传图片")
+    encoded_image = matched.group(2)
+    if len(encoded_image) > MAX_IMAGE_BYTES * 4 // 3 + 16:
+        raise ValueError("图片过大，无法生成标题")
+    try:
+        decoded_image = base64.b64decode(encoded_image, validate=True)
+    except (ValueError, binascii.Error):
+        raise ValueError("图片标题请求无效，请重新上传图片") from None
+    if not 0 < len(decoded_image) <= MAX_IMAGE_BYTES:
+        raise ValueError("图片过大，无法生成标题")
+
+    request_body = {
+        "model": VISION_MODEL,
+        "temperature": 0.35,
+        "max_tokens": 180,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You create product titles for an international handmade marketplace from the supplied image. Return exactly one valid JSON object and nothing else: {\"englishTitle\": \"...\", \"chineseTitle\": \"...\"}. englishTitle must be a natural, search-optimized English title of at most 125 English characters. Include the handmade craft or item type, a material only when visually supported, the visible design or style, and a likely decor, gift, or practical use when supported. chineseTitle must be a concise Simplified Chinese reference translation of the English title, at most 50 Chinese characters. Do not add explanations, Markdown, labels, a brand, exact material, measurements, or features that cannot be verified from the image.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请为这件手工艺作品生成标题。"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": source_image},
+                    },
+                ],
+            },
+        ],
+    }
+    request = Request(
+        seller_ai_title_endpoint(),
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {VISION_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise ValueError("AI 标题生成暂时无法响应，请稍后重试") from error
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    content = choices[0].get("message", {}).get("content") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else ""
+    if isinstance(content, list):
+        content = "".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
+    raw_content = str(content or "").strip()
+    json_content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content, flags=re.IGNORECASE).strip()
+    try:
+        generated = json.loads(json_content)
+    except json.JSONDecodeError:
+        generated = None
+    if isinstance(generated, dict):
+        english_title = str(generated.get("englishTitle") or "").strip()
+        chinese_title = str(generated.get("chineseTitle") or "").strip()
+    else:
+        english_title = raw_content
+        chinese_title = ""
+    english_title = re.sub(r"\s+", " ", english_title).strip().strip("\"'“”‘’")
+    english_title = re.sub(r"^(?:作品)?标题\s*[：:]\s*", "", english_title).strip()
+    chinese_title = re.sub(r"\s+", " ", chinese_title).strip().strip("\"'“”‘’")
+    if not english_title:
+        raise ValueError("AI 服务未返回有效标题，请稍后重试")
+    return {
+        "englishTitle": truncate_product_title(english_title),
+        "chineseTitle": chinese_title[:50],
+    }
 
 
 ORDER_STATUS_LABELS = {
@@ -1057,11 +2654,107 @@ ORDER_STATUS_LABELS = {
 }
 
 
+def public_brand_site(domain: str = "", shop_id: str = "", preview_owner_id: str | None = None) -> dict | None:
+    """Return a published visitor storefront, or its owner's authenticated preview."""
+    normalized_domain = str(domain or "").strip().lower().removeprefix("https://").removeprefix("http://").split("/", 1)[0].rstrip(".")
+    with database() as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT * FROM shops WHERE status = 'active' ORDER BY updated_at DESC").fetchall()
+        selected = None
+        settings: dict = {}
+        for row in rows:
+            try:
+                candidate_settings = json.loads(row["settings_json"] or "{}")
+            except json.JSONDecodeError:
+                candidate_settings = {}
+            if not isinstance(candidate_settings, dict):
+                candidate_settings = {}
+            owner_preview = bool(
+                preview_owner_id
+                and shop_id
+                and str(row["id"]) == shop_id
+                and str(row["owner_user_id"]) == preview_owner_id
+            )
+            brand_site = candidate_settings.get("brandSite")
+            if not isinstance(brand_site, dict):
+                if not owner_preview:
+                    continue
+                brand_site = {
+                    "enabled": False,
+                    "template": "dawn",
+                    "siteName": "",
+                    "tagline": "",
+                    "themeColor": "#e66020",
+                    "logoUrl": "",
+                    "domain": "",
+                    "status": "draft",
+                    "sections": [],
+                }
+                candidate_settings["brandSite"] = brand_site
+            if brand_site.get("status") != "published" and not owner_preview:
+                continue
+            configured_domain = str(brand_site.get("domain") or "").strip().lower().removeprefix("https://").removeprefix("http://").split("/", 1)[0].rstrip(".")
+            if (shop_id and str(row["id"]) == shop_id) or (
+                not shop_id and normalized_domain and configured_domain == normalized_domain
+            ):
+                selected, settings = row, candidate_settings
+                break
+        if not selected:
+            return None
+        brand_site = settings["brandSite"]
+        return_policy = settings.get("returnPolicy") if isinstance(settings.get("returnPolicy"), dict) else {}
+        shop = {
+            "id": 99,
+            "analyticsShopId": selected["id"],
+            "name": selected["name"],
+            "location": selected["location"] or "",
+            "banner": selected["banner_url"] or "",
+            "avatar": selected["avatar_url"] or "",
+            "description": selected["description"] or "",
+            "status": "active",
+            "returnPolicy": {
+                "acceptsReturns": bool(return_policy.get("acceptsReturns", True)),
+                "windowDays": max(1, min(30, int(return_policy.get("windowDays", 7) or 7))),
+                "instructions": str(return_policy.get("instructions") or "")[:500],
+            },
+        }
+    return {"shop": shop, "brandSite": brand_site, "products": catalog((str(selected["id"]),), ("published",))}
+
+
 def catalog_product_number(product_id: str) -> int:
     try:
         return int(product_id.rsplit("-", 1)[-1])
     except ValueError:
         return int(hashlib.sha256(product_id.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def featured_product_ids_for_shop(connection: sqlite3.Connection, shop_id: str, raw_ids: object) -> list[str]:
+    if not isinstance(raw_ids, list):
+        return []
+    published_ids = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT id FROM products WHERE shop_id = ? AND status = 'published' ORDER BY published_at DESC, created_at DESC",
+            (shop_id,),
+        )
+    ]
+    published_set = set(published_ids)
+    legacy_ids = {catalog_product_number(product_id): product_id for product_id in published_ids}
+    featured: list[str] = []
+    for raw_id in raw_ids:
+        if isinstance(raw_id, bool):
+            continue
+        product_id = str(raw_id)
+        if product_id not in published_set:
+            try:
+                product_id = legacy_ids[int(raw_id)]
+            except (TypeError, ValueError, KeyError):
+                continue
+        if product_id not in featured:
+            featured.append(product_id)
+        if len(featured) == 2:
+            break
+    return featured
 
 
 def seller_shop_ids(connection: sqlite3.Connection, user_id: str) -> list[str]:
@@ -1128,6 +2821,65 @@ def finance_fee_bps(connection: sqlite3.Connection) -> int:
     return max(0, min(3000, int(row[0] if row else 500)))
 
 
+def add_business_days(start: datetime, days: int) -> datetime:
+    """Add weekday-only settlement hold days (Saturday and Sunday are skipped)."""
+    current = start
+    remaining = max(0, days)
+    while remaining:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
+
+def database_datetime(value: str | None) -> datetime:
+    if value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def payout_schedule_next_at(schedule: str, now: datetime | None = None) -> str:
+    """Return the next platform payout window; provider transfer execution is separate."""
+    current = now or datetime.now(timezone.utc)
+    if schedule == "daily":
+        target = current + timedelta(days=1)
+    elif schedule == "monthly":
+        target = (current.replace(day=1) + timedelta(days=32)).replace(day=1)
+    else:
+        days_until_monday = (7 - current.weekday()) % 7
+        target = current + timedelta(days=days_until_monday or 7)
+        if schedule == "biweekly":
+            anchor = datetime(2026, 1, 5, tzinfo=timezone.utc)
+            if ((target.date() - anchor.date()).days // 7) % 2:
+                target += timedelta(days=7)
+    return target.strftime("%Y-%m-%d")
+
+
+def settlement_hold_until(connection: sqlite3.Connection, order_id: str, completed_at: str | None) -> str:
+    """Calculate a seller's hold deadline, with an explicit extension point for new-seller risk."""
+    profile = connection.execute(
+        """
+        SELECT seller_profiles.payout_risk_hold_business_days, users.created_at
+        FROM orders
+        JOIN shops ON shops.id = orders.shop_id
+        LEFT JOIN seller_profiles ON seller_profiles.user_id = shops.owner_user_id
+        LEFT JOIN users ON users.id = shops.owner_user_id
+        WHERE orders.id = ?
+        """,
+        (order_id,),
+    ).fetchone()
+    extra_days = 0
+    if profile and profile[1]:
+        seller_created_at = database_datetime(profile[1])
+        if seller_created_at > datetime.now(timezone.utc) - timedelta(days=NEW_SELLER_RISK_WINDOW_DAYS):
+            extra_days = max(0, int(profile[0] or 0))
+    return add_business_days(database_datetime(completed_at), SETTLEMENT_HOLD_BUSINESS_DAYS + extra_days).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def ensure_shop_wallet(connection: sqlite3.Connection, shop_id: str) -> None:
     connection.execute("INSERT OR IGNORE INTO shop_wallets (shop_id) VALUES (?)", (shop_id,))
 
@@ -1160,7 +2912,7 @@ def write_wallet_ledger(
 def create_order_settlement(connection: sqlite3.Connection, order_id: str) -> bool:
     """Move a successful order into the seller's pending balance exactly once."""
     connection.row_factory = sqlite3.Row
-    order = connection.execute("SELECT id, shop_id, paid_amount_cents, status, paid_at FROM orders WHERE id = ?", (order_id,)).fetchone()
+    order = connection.execute("SELECT id, shop_id, paid_amount_cents, settlement_currency, settlement_exchange_rate, status, paid_at FROM orders WHERE id = ?", (order_id,)).fetchone()
     if not order or not order["paid_at"] or order["status"] in ("pending_payment", "cancelled", "refunded"):
         return False
     fee_bps = finance_fee_bps(connection)
@@ -1171,10 +2923,10 @@ def create_order_settlement(connection: sqlite3.Connection, order_id: str) -> bo
     inserted = connection.execute(
         """
         INSERT OR IGNORE INTO shop_settlements
-          (id, shop_id, order_id, gross_cents, platform_fee_cents, net_cents, fee_rate_bps)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (id, shop_id, order_id, gross_cents, platform_fee_cents, net_cents, fee_rate_bps, settlement_currency, settlement_exchange_rate)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (settlement_id, order["shop_id"], order_id, gross, fee, net, fee_bps),
+        (settlement_id, order["shop_id"], order_id, gross, fee, net, fee_bps, order["settlement_currency"], order["settlement_exchange_rate"]),
     ).rowcount
     if not inserted:
         return False
@@ -1184,36 +2936,245 @@ def create_order_settlement(connection: sqlite3.Connection, order_id: str) -> bo
     return True
 
 
-def release_order_settlement(connection: sqlite3.Connection, order_id: str) -> bool:
-    """Release a completed order from pending settlement to withdrawable balance."""
+def schedule_order_settlement_hold(connection: sqlite3.Connection, order_id: str) -> bool:
+    """Start the post-completion settlement hold exactly once."""
     connection.row_factory = sqlite3.Row
+    order = connection.execute("SELECT id, status, completed_at FROM orders WHERE id = ?", (order_id,)).fetchone()
     settlement = connection.execute("SELECT * FROM shop_settlements WHERE order_id = ?", (order_id,)).fetchone()
-    if not settlement or settlement["status"] != "pending":
+    if not order or order["status"] != "completed" or not settlement or settlement["status"] != "pending" or settlement["hold_until"]:
+        return False
+    hold_until = settlement_hold_until(connection, order_id, order["completed_at"])
+    changed = connection.execute(
+        "UPDATE shop_settlements SET hold_started_at = COALESCE(hold_started_at, ?), hold_until = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending' AND hold_until IS NULL",
+        (order["completed_at"] or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), hold_until, settlement["id"]),
+    ).rowcount
+    return bool(changed)
+
+
+def order_has_open_after_sale(connection: sqlite3.Connection, order_id: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM after_sale_requests WHERE order_id = ? AND status IN ('pending', 'approved') LIMIT 1",
+        (order_id,),
+    ).fetchone()
+    return bool(row)
+
+
+def release_order_settlement(connection: sqlite3.Connection, order_id: str) -> bool:
+    """Release a completed, unfrozen order into the seller's available balance."""
+    connection.row_factory = sqlite3.Row
+    order = connection.execute("SELECT status FROM orders WHERE id = ?", (order_id,)).fetchone()
+    settlement = connection.execute("SELECT * FROM shop_settlements WHERE order_id = ?", (order_id,)).fetchone()
+    if (
+        not order
+        or order["status"] != "completed"
+        or not settlement
+        or settlement["status"] != "pending"
+        or not settlement["hold_until"]
+        or settlement["hold_until"] > datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        or order_has_open_after_sale(connection, order_id)
+    ):
         return False
     changed = connection.execute("UPDATE shop_settlements SET status = 'available', available_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'", (settlement["id"],)).rowcount
     if not changed:
         return False
     ensure_shop_wallet(connection, settlement["shop_id"])
-    connection.execute("UPDATE shop_wallets SET pending_cents = pending_cents - ?, available_cents = available_cents + ?, updated_at = CURRENT_TIMESTAMP WHERE shop_id = ?", (settlement["net_cents"], settlement["net_cents"], settlement["shop_id"]))
-    write_wallet_ledger(connection, settlement["shop_id"], "order_available", settlement_id=settlement["id"], available=settlement["net_cents"], pending=-settlement["net_cents"], note=f"订单 {order_id} 结算完成")
+    wallet = connection.execute("SELECT refund_debt_cents FROM shop_wallets WHERE shop_id = ?", (settlement["shop_id"],)).fetchone()
+    releasable_net = max(0, int(settlement["net_cents"]) - int(settlement["refunded_net_cents"] or 0))
+    debt_offset = min(releasable_net, int(wallet["refund_debt_cents"] if wallet else 0))
+    available_delta = releasable_net - debt_offset
+    connection.execute(
+        "UPDATE shop_wallets SET pending_cents = pending_cents - ?, available_cents = available_cents + ?, refund_debt_cents = refund_debt_cents - ?, updated_at = CURRENT_TIMESTAMP WHERE shop_id = ?",
+        (releasable_net, available_delta, debt_offset, settlement["shop_id"]),
+    )
+    note = f"订单 {order_id} 结算完成" + (f"，抵扣退款欠款 {debt_offset / 100:.2f} USD" if debt_offset else "")
+    write_wallet_ledger(connection, settlement["shop_id"], "order_available", settlement_id=settlement["id"], available=available_delta, pending=-releasable_net, note=note)
     return True
 
 
+def apply_settlement_refund(connection: sqlite3.Connection, order_id: str, amount_cents: int, refund_id: str | None = None) -> dict:
+    """Reverse a whole or partial USD refund from the seller balance exactly once."""
+    connection.row_factory = sqlite3.Row
+    settlement = connection.execute("SELECT * FROM shop_settlements WHERE order_id = ?", (order_id,)).fetchone()
+    if not settlement or settlement["status"] == "reversed":
+        raise ValueError("订单结算单不可退款")
+    amount = max(0, int(amount_cents))
+    remaining = max(0, int(settlement["gross_cents"]) - int(settlement["refunded_gross_cents"] or 0))
+    if amount <= 0 or amount > remaining:
+        raise ValueError("退款金额超过订单可退款余额")
+    current_fee = int(settlement["refunded_fee_cents"] or 0)
+    target_refunded_gross = int(settlement["refunded_gross_cents"] or 0) + amount
+    target_fee = target_refunded_gross * int(settlement["fee_rate_bps"]) // 10000
+    fee_reversal = target_fee - current_fee
+    seller_net_reversal = amount - fee_reversal
+    target_refunded_net = int(settlement["refunded_net_cents"] or 0) + seller_net_reversal
+    fully_refunded = target_refunded_gross == int(settlement["gross_cents"])
+    connection.execute(
+        """
+        UPDATE shop_settlements
+        SET refunded_gross_cents = ?, refunded_fee_cents = ?, refunded_net_cents = ?,
+            status = CASE WHEN ? THEN 'reversed' ELSE status END,
+            reversed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE reversed_at END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (target_refunded_gross, target_fee, target_refunded_net, fully_refunded, fully_refunded, settlement["id"]),
+    )
+    ensure_shop_wallet(connection, settlement["shop_id"])
+    pending_delta = -seller_net_reversal if settlement["status"] == "pending" else 0
+    available_delta = 0
+    refund_debt_delta = 0
+    if settlement["status"] == "available":
+        wallet = connection.execute("SELECT available_cents FROM shop_wallets WHERE shop_id = ?", (settlement["shop_id"],)).fetchone()
+        available_before = int(wallet["available_cents"] if wallet else 0)
+        available_reversal = min(available_before, seller_net_reversal)
+        available_delta = -available_reversal
+        refund_debt_delta = seller_net_reversal - available_reversal
+    connection.execute(
+        "UPDATE shop_wallets SET pending_cents = pending_cents + ?, available_cents = available_cents + ?, refund_debt_cents = refund_debt_cents + ?, updated_at = CURRENT_TIMESTAMP WHERE shop_id = ?",
+        (pending_delta, available_delta, refund_debt_delta, settlement["shop_id"]),
+    )
+    note = f"订单 {order_id} 退款冲回 {amount / 100:.2f} USD"
+    if refund_debt_delta:
+        note += f"，待后续结算抵扣 {refund_debt_delta / 100:.2f} USD"
+    write_wallet_ledger(connection, settlement["shop_id"], "refund_reversal", settlement_id=settlement["id"], available=available_delta, pending=pending_delta, note=note)
+    if refund_id:
+        connection.execute(
+            "UPDATE order_refunds SET platform_fee_reversal_cents = ?, seller_net_reversal_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (fee_reversal, seller_net_reversal, refund_id),
+        )
+    return {
+        "amountCents": amount,
+        "platformFeeReversalCents": fee_reversal,
+        "sellerNetReversalCents": seller_net_reversal,
+        "fullyRefunded": fully_refunded,
+    }
+
+
+def record_after_sale_refund(connection: sqlite3.Connection, after_sale_id: str) -> dict:
+    """Record an approved refund at its request-time currency and exchange-rate lock."""
+    connection.row_factory = sqlite3.Row
+    request = connection.execute("SELECT * FROM after_sale_requests WHERE id = ?", (after_sale_id,)).fetchone()
+    if not request:
+        raise ValueError("售后申请不存在")
+    existing = connection.execute("SELECT * FROM order_refunds WHERE after_sale_id = ?", (after_sale_id,)).fetchone()
+    if existing:
+        return {"id": existing["id"], "amountCents": existing["amount_cents"], "fullyRefunded": False}
+    order = connection.execute("SELECT * FROM orders WHERE id = ?", (request["order_id"],)).fetchone()
+    if not order or not order["paid_at"]:
+        raise ValueError("订单尚未支付，不能退款")
+    if request["refund_currency"] != order["payment_currency"] or request["refund_exchange_rate"] != order["payment_exchange_rate"]:
+        raise ValueError("退款币种或汇率与订单锁定值不一致")
+    refund_id = f"refund-{secrets.token_urlsafe(10)}"
+    connection.execute(
+        "INSERT INTO order_refunds (id, order_id, after_sale_id, amount_cents, currency, exchange_rate) VALUES (?, ?, ?, ?, ?, ?)",
+        (refund_id, order["id"], after_sale_id, request["requested_amount_cents"], request["refund_currency"], request["refund_exchange_rate"]),
+    )
+    result = apply_settlement_refund(connection, order["id"], int(request["requested_amount_cents"]), refund_id)
+    return {"id": refund_id, **result}
+
+
+def complete_order_and_start_settlement_hold(connection: sqlite3.Connection, order_id: str) -> bool:
+    """Complete an order and begin its hold period; safe to call repeatedly."""
+    connection.row_factory = sqlite3.Row
+    order = connection.execute("SELECT id, status FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order or order["status"] in ("cancelled", "refunded", "refunding"):
+        return False
+    completed_now = False
+    if order["status"] != "completed":
+        completed_now = bool(connection.execute(
+            "UPDATE orders SET status = 'completed', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('shipped', 'delivered')",
+            (order_id,),
+        ).rowcount)
+    connection.execute(
+        "UPDATE shipments SET status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE order_id = ?",
+        (order_id,),
+    )
+    create_order_settlement(connection, order_id)
+    hold_started = schedule_order_settlement_hold(connection, order_id)
+    return completed_now or hold_started
+
+
+def is_delivered_tracking_event(label: str, detail: str) -> bool:
+    return bool(re.search(r"\bdelivered\b|已妥投|已投递|已签收", f"{label} {detail}", re.IGNORECASE))
+
+
+def logistics_provider_for_carrier(carrier: str) -> str:
+    value = str(carrier or "").strip().lower()
+    if "sf" in value or "顺丰" in value:
+        return "sf"
+    if "dhl" in value:
+        return "dhl"
+    if "fedex" in value:
+        return "fedex"
+    if "ups" in value:
+        return "ups"
+    if "usps" in value:
+        return "usps"
+    return "manual"
+
+
+def logistics_webhook_is_valid(raw_body: bytes, signature: str) -> bool:
+    if not LOGISTICS_WEBHOOK_SECRET or not signature:
+        return False
+    expected = hmac.new(LOGISTICS_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return secrets.compare_digest(expected, signature.strip().removeprefix("sha256="))
+
+
+def record_logistics_webhook_event(connection: sqlite3.Connection, payload: dict) -> dict:
+    """Process a signed provider callback idempotently; seller-entered text never completes an order."""
+    provider = str(payload.get("provider") or "").strip().lower()
+    event_id = str(payload.get("eventId") or "").strip()
+    tracking_no = str(payload.get("trackingNo") or "").strip()
+    status = str(payload.get("status") or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{2,40}", provider) or not event_id or len(event_id) > 160 or not tracking_no or len(tracking_no) > 160:
+        raise ValueError("物流回调参数无效")
+    if status not in {"label_created", "in_transit", "exception", "returned", "delivered"}:
+        raise ValueError("不支持的物流状态")
+    connection.row_factory = sqlite3.Row
+    shipment = connection.execute(
+        "SELECT shipments.*, orders.order_no, orders.shop_id, orders.buyer_user_id FROM shipments JOIN orders ON orders.id = shipments.order_id WHERE shipments.logistics_provider = ? AND COALESCE(shipments.provider_tracking_id, shipments.tracking_no) = ?",
+        (provider, tracking_no),
+    ).fetchone()
+    if not shipment:
+        raise ValueError("未找到对应物流单")
+    inserted = connection.execute(
+        "INSERT OR IGNORE INTO logistics_webhook_events (id, provider, external_event_id, shipment_id, event_type, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (f"logistics-webhook-{secrets.token_urlsafe(10)}", provider, event_id, shipment["id"], status, json.dumps(payload, ensure_ascii=False)),
+    ).rowcount
+    if not inserted:
+        return {"accepted": False, "duplicate": True, "orderNo": shipment["order_no"], "completed": False}
+    label = str(payload.get("label") or status.replace("_", " ").title())[:240]
+    detail = str(payload.get("detail") or "")[:1000]
+    occurred_at = str(payload.get("occurredAt") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))[:40]
+    connection.execute(
+        "INSERT INTO shipment_events (id, shipment_id, event_at, label, detail) VALUES (?, ?, ?, ?, ?)",
+        (f"event-{secrets.token_urlsafe(8)}", shipment["id"], occurred_at, label, detail),
+    )
+    connection.execute(
+        "UPDATE shipments SET status = CASE WHEN ? = 'delivered' THEN 'delivered' WHEN ? = 'in_transit' THEN 'in_transit' ELSE status END, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, ?) ELSE delivered_at END, last_tracking_status = ?, last_tracking_at = ? WHERE id = ?",
+        (status, status, status, occurred_at, status, occurred_at, shipment["id"]),
+    )
+    completed = False
+    if status == "delivered":
+        completed = complete_order_and_start_settlement_hold(connection, shipment["order_id"])
+        if completed:
+            owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shipment["shop_id"],)).fetchone()
+            if owner:
+                notify_governance(connection, owner[0], "order_completed", "订单已完成", f"订单 {shipment['order_no']} 已由物流商妥投", "order", shipment["order_no"])
+            notify_governance(connection, shipment["buyer_user_id"], "review_reminder", "订单已完成，等待评价", "分享你的使用感受，帮助更多手作爱好者", "order", shipment["order_no"])
+    return {"accepted": True, "duplicate": False, "orderNo": shipment["order_no"], "completed": completed}
+
+
 def reverse_order_settlement(connection: sqlite3.Connection, order_id: str) -> bool:
-    """Reverse an order settlement once when its order is refunded."""
+    """Reverse the remaining settlement amount for legacy full-refund callers."""
     connection.row_factory = sqlite3.Row
     settlement = connection.execute("SELECT * FROM shop_settlements WHERE order_id = ?", (order_id,)).fetchone()
     if not settlement or settlement["status"] == "reversed":
         return False
-    previous_status = settlement["status"]
-    changed = connection.execute("UPDATE shop_settlements SET status = 'reversed', reversed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?", (settlement["id"], previous_status)).rowcount
-    if not changed:
+    remaining = int(settlement["gross_cents"]) - int(settlement["refunded_gross_cents"] or 0)
+    if remaining <= 0:
         return False
-    ensure_shop_wallet(connection, settlement["shop_id"])
-    pending_delta = -settlement["net_cents"] if previous_status == "pending" else 0
-    available_delta = -settlement["net_cents"] if previous_status == "available" else 0
-    connection.execute("UPDATE shop_wallets SET pending_cents = pending_cents + ?, available_cents = available_cents + ?, updated_at = CURRENT_TIMESTAMP WHERE shop_id = ?", (pending_delta, available_delta, settlement["shop_id"]))
-    write_wallet_ledger(connection, settlement["shop_id"], "refund_reversal", settlement_id=settlement["id"], pending=pending_delta, available=available_delta, note=f"订单 {order_id} 退款冲回")
+    apply_settlement_refund(connection, order_id, remaining)
     return True
 
 
@@ -1225,6 +3186,7 @@ def ensure_finance_for_paid_orders(connection: sqlite3.Connection, shop_ids: lis
     for row in connection.execute(f"SELECT id, status FROM orders WHERE {where}", tuple(params)).fetchall():
         create_order_settlement(connection, row[0])
         if row[1] == "completed":
+            schedule_order_settlement_hold(connection, row[0])
             release_order_settlement(connection, row[0])
 
 
@@ -1239,11 +3201,21 @@ def seller_finance_payload(connection: sqlite3.Connection, user_id: str) -> dict
     settlements = connection.execute(f"SELECT shop_settlements.*, orders.order_no FROM shop_settlements JOIN orders ON orders.id = shop_settlements.order_id WHERE shop_settlements.shop_id IN ({marks}) ORDER BY shop_settlements.created_at DESC LIMIT 100", tuple(shop_ids)).fetchall()
     ledger = connection.execute(f"SELECT * FROM shop_wallet_ledger WHERE shop_id IN ({marks}) ORDER BY created_at DESC LIMIT 100", tuple(shop_ids)).fetchall()
     withdrawals = connection.execute(f"SELECT shop_withdrawal_requests.*, shops.name AS shop_name FROM shop_withdrawal_requests JOIN shops ON shops.id = shop_withdrawal_requests.shop_id WHERE shop_withdrawal_requests.shop_id IN ({marks}) ORDER BY shop_withdrawal_requests.created_at DESC LIMIT 100", tuple(shop_ids)).fetchall()
-    totals = {key: sum(int(row[key] or 0) for row in wallets) for key in ("available_cents", "pending_cents", "withdrawing_cents", "withdrawn_cents")}
+    totals = {key: sum(int(row[key] or 0) for row in wallets) for key in ("available_cents", "pending_cents", "withdrawing_cents", "withdrawn_cents", "refund_debt_cents")}
+    profile = connection.execute("SELECT payout_schedule FROM seller_profiles WHERE user_id = ?", (user_id,)).fetchone()
+    payout_schedule = (profile["payout_schedule"] if profile else "weekly") or "weekly"
+    if payout_schedule not in SELLER_PAYOUT_SCHEDULES:
+        payout_schedule = "weekly"
     return {
-        "feeRateBps": finance_fee_bps(connection), "wallet": {"available": totals["available_cents"] / 100, "pending": totals["pending_cents"] / 100, "withdrawing": totals["withdrawing_cents"] / 100, "withdrawn": totals["withdrawn_cents"] / 100},
-        "shops": [{"id": row["shop_id"], "name": row["shop_name"], "available": row["available_cents"] / 100, "pending": row["pending_cents"] / 100, "withdrawing": row["withdrawing_cents"] / 100, "withdrawn": row["withdrawn_cents"] / 100} for row in wallets],
-        "settlements": [{"id": row["id"], "orderNo": row["order_no"], "shopId": row["shop_id"], "gross": row["gross_cents"] / 100, "fee": row["platform_fee_cents"] / 100, "net": row["net_cents"] / 100, "status": row["status"], "createdAt": row["created_at"], "availableAt": row["available_at"]} for row in settlements],
+        "currency": PLATFORM_CURRENCY,
+        "feeRateBps": finance_fee_bps(connection), "wallet": {"available": totals["available_cents"] / 100, "pending": totals["pending_cents"] / 100, "withdrawing": totals["withdrawing_cents"] / 100, "withdrawn": totals["withdrawn_cents"] / 100, "refundDebt": totals["refund_debt_cents"] / 100},
+        "payoutSchedule": payout_schedule,
+        "nextPayoutAt": payout_schedule_next_at(payout_schedule),
+        "minimumPayout": SETTLEMENT_MIN_PAYOUT_CENTS / 100,
+        "holdBusinessDays": SETTLEMENT_HOLD_BUSINESS_DAYS,
+        "newSellerRiskWindowDays": NEW_SELLER_RISK_WINDOW_DAYS,
+        "shops": [{"id": row["shop_id"], "name": row["shop_name"], "available": row["available_cents"] / 100, "pending": row["pending_cents"] / 100, "withdrawing": row["withdrawing_cents"] / 100, "withdrawn": row["withdrawn_cents"] / 100, "refundDebt": row["refund_debt_cents"] / 100} for row in wallets],
+        "settlements": [{"id": row["id"], "orderNo": row["order_no"], "shopId": row["shop_id"], "gross": (row["gross_cents"] - row["refunded_gross_cents"]) / 100, "fee": (row["platform_fee_cents"] - row["refunded_fee_cents"]) / 100, "net": (row["net_cents"] - row["refunded_net_cents"]) / 100, "refundedAmount": row["refunded_gross_cents"] / 100, "currency": row["settlement_currency"], "exchangeRate": row["settlement_exchange_rate"], "status": row["status"], "createdAt": row["created_at"], "holdUntil": row["hold_until"], "availableAt": row["available_at"]} for row in settlements],
         "ledger": [{"id": row["id"], "type": row["entry_type"], "availableDelta": row["available_delta_cents"] / 100, "pendingDelta": row["pending_delta_cents"] / 100, "withdrawingDelta": row["withdrawing_delta_cents"] / 100, "withdrawnDelta": row["withdrawn_delta_cents"] / 100, "note": row["note"], "createdAt": row["created_at"]} for row in ledger],
         "withdrawals": [{"id": row["id"], "shopId": row["shop_id"], "shop": row["shop_name"], "amount": row["amount_cents"] / 100, "recipientType": row["recipient_type"], "recipient": row["recipient_snapshot"], "status": row["status"], "note": row["reviewer_note"], "createdAt": row["created_at"], "reviewedAt": row["reviewed_at"], "paidAt": row["paid_at"]} for row in withdrawals],
     }
@@ -1268,10 +3240,10 @@ def payout_account_mask(account: str) -> str:
 def admin_finance_payload(connection: sqlite3.Connection) -> dict:
     connection.row_factory = sqlite3.Row
     ensure_finance_for_paid_orders(connection)
-    wallet = connection.execute("SELECT COALESCE(SUM(available_cents), 0), COALESCE(SUM(pending_cents), 0), COALESCE(SUM(withdrawing_cents), 0), COALESCE(SUM(withdrawn_cents), 0) FROM shop_wallets").fetchone()
-    fees = connection.execute("SELECT COALESCE(SUM(platform_fee_cents), 0) FROM shop_settlements WHERE status != 'reversed'").fetchone()[0]
+    wallet = connection.execute("SELECT COALESCE(SUM(available_cents), 0), COALESCE(SUM(pending_cents), 0), COALESCE(SUM(withdrawing_cents), 0), COALESCE(SUM(withdrawn_cents), 0), COALESCE(SUM(refund_debt_cents), 0) FROM shop_wallets").fetchone()
+    fees = connection.execute("SELECT COALESCE(SUM(platform_fee_cents - refunded_fee_cents), 0) FROM shop_settlements").fetchone()[0]
     rows = connection.execute("SELECT shop_withdrawal_requests.*, shops.name AS shop_name, users.display_name AS applicant FROM shop_withdrawal_requests JOIN shops ON shops.id = shop_withdrawal_requests.shop_id JOIN users ON users.id = shop_withdrawal_requests.applicant_user_id ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC LIMIT 200").fetchall()
-    return {"feeRateBps": finance_fee_bps(connection), "summary": {"available": wallet[0] / 100, "pending": wallet[1] / 100, "withdrawing": wallet[2] / 100, "withdrawn": wallet[3] / 100, "platformFees": fees / 100}, "withdrawals": [{"id": row["id"], "shop": row["shop_name"], "applicant": row["applicant"], "amount": row["amount_cents"] / 100, "recipientType": row["recipient_type"], "recipient": row["recipient_snapshot"], "status": row["status"], "note": row["reviewer_note"], "createdAt": row["created_at"]} for row in rows]}
+    return {"feeRateBps": finance_fee_bps(connection), "summary": {"available": wallet[0] / 100, "pending": wallet[1] / 100, "withdrawing": wallet[2] / 100, "withdrawn": wallet[3] / 100, "refundDebt": wallet[4] / 100, "platformFees": fees / 100}, "withdrawals": [{"id": row["id"], "shop": row["shop_name"], "applicant": row["applicant"], "amount": row["amount_cents"] / 100, "recipientType": row["recipient_type"], "recipient": row["recipient_snapshot"], "status": row["status"], "note": row["reviewer_note"], "createdAt": row["created_at"]} for row in rows]}
 
 
 def write_shop_staff_audit(
@@ -1318,27 +3290,44 @@ def admin_verification_destination(connection: sqlite3.Connection, user_id: str)
     row = connection.execute("SELECT email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
     if not row:
         raise ValueError("管理员账号不存在")
-    destination = str(row[0] or row[1] or "").strip().lower()
+    # Prefer the real mobile number: Tencent Cloud SMS cannot deliver to email.
+    destination = str(row[1] or row[0] or "").strip().lower()
     if not destination:
         raise ValueError("管理员账号未设置邮箱或手机号")
     return destination
 
 
-def require_admin_step_up(handler: BaseHTTPRequestHandler, user_id: str) -> None:
+def require_admin_step_up(handler: BaseHTTPRequestHandler, user_id: str, *, force_fresh: bool = False) -> None:
+    """Validate an administrator's recent identity verification.
+
+    Standard tickets can be reused for one hour.  A high-risk ticket is
+    issued only after an explicit fresh verification and is consumed on use.
+    """
     ticket = str(handler.headers.get("X-Admin-Step-Up") or "").strip()
-    if not ticket:
+    current_session = session_token(handler)
+    if not ticket or not current_session:
         raise StepUpRequiredError()
     with database() as connection:
-        updated = connection.execute(
-            """
-            UPDATE admin_step_up_tickets
-            SET consumed_at = CURRENT_TIMESTAMP
-            WHERE user_id = ? AND ticket_hash = ? AND consumed_at IS NULL
-              AND expires_at > CURRENT_TIMESTAMP
-            """,
-            (user_id, token_hash(ticket)),
-        ).rowcount
-    if not updated:
+        if force_fresh:
+            valid = connection.execute(
+                """
+                UPDATE admin_step_up_tickets
+                SET consumed_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND ticket_hash = ? AND session_token_hash = ? AND scope = 'high_risk'
+                  AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+                """,
+                (user_id, token_hash(ticket), token_hash(current_session)),
+            ).rowcount
+        else:
+            valid = connection.execute(
+                """
+                SELECT 1 FROM admin_step_up_tickets
+                WHERE user_id = ? AND ticket_hash = ? AND session_token_hash = ? AND consumed_at IS NULL
+                  AND expires_at > CURRENT_TIMESTAMP
+                """,
+                (user_id, token_hash(ticket), token_hash(current_session)),
+            ).fetchone()
+    if not valid:
         raise StepUpRequiredError()
 
 
@@ -1400,7 +3389,6 @@ def least_loaded_admin(connection: sqlite3.Connection) -> str | None:
 
 def ensure_governance_tasks(connection: sqlite3.Connection) -> None:
     for task_type, table, predicate in (
-        ("product_moderation", "products", "moderation_status = 'pending'"),
         ("report", "content_reports", "status = 'pending'"),
         ("appeal", "governance_appeals", "status = 'pending'"),
     ):
@@ -1654,7 +3642,7 @@ def seller_workspace(user_id: str) -> dict:
             shop_id = f"shop-{user_id}"
             connection.execute(
                 "INSERT INTO shops (id, owner_user_id, name) VALUES (?, ?, ?)",
-                (shop_id, user_id, f"{user['display_name']}的手作店"),
+                (shop_id, user_id, user["display_name"]),
             )
             connection.execute("INSERT OR IGNORE INTO seller_profiles (user_id, verification_status) VALUES (?, 'pending')", (user_id,))
             shop_ids = [shop_id]
@@ -1669,6 +3657,7 @@ def seller_workspace(user_id: str) -> dict:
             shipping_template = json.loads(shop["shipping_template_json"] or "{}")
         except json.JSONDecodeError:
             shipping_template = {}
+        shipping_template = normalize_shipping_template(shipping_template)
         try:
             coupons = json.loads(shop["coupons_json"] or "[]")
         except json.JSONDecodeError:
@@ -1677,6 +3666,21 @@ def seller_workspace(user_id: str) -> dict:
             settings = json.loads(shop["settings_json"] or "{}")
         except json.JSONDecodeError:
             settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        stored_return_policy = settings.get("returnPolicy") if isinstance(settings.get("returnPolicy"), dict) else {}
+        try:
+            return_window_days = int(stored_return_policy.get("windowDays", 7) or 7)
+        except (TypeError, ValueError):
+            return_window_days = 7
+        return_policy = {
+            "acceptsReturns": bool(stored_return_policy.get("acceptsReturns", True)),
+            "windowDays": max(1, min(30, return_window_days)),
+            "recipientName": str(stored_return_policy.get("recipientName") or "")[:80],
+            "recipientPhone": str(stored_return_policy.get("recipientPhone") or "")[:40],
+            "address": str(stored_return_policy.get("address") or "")[:300],
+            "instructions": str(stored_return_policy.get("instructions") or "")[:500],
+        }
         shop_response = {
             "id": 99,
             "analyticsShopId": shop["id"],
@@ -1691,8 +3695,10 @@ def seller_workspace(user_id: str) -> dict:
             "followers": follower_count,
             "status": "paused" if shop["status"] == "paused" else "active",
             "shippingTemplate": shipping_template,
+            "returnPolicy": return_policy,
             "coupons": coupons if isinstance(coupons, list) else [],
-            "featuredProductIds": settings.get("featuredProductIds") if isinstance(settings.get("featuredProductIds"), list) else [],
+            "featuredProductIds": featured_product_ids_for_shop(connection, shop["id"], settings.get("featuredProductIds")),
+            "brandSite": settings.get("brandSite") if isinstance(settings.get("brandSite"), dict) else None,
         }
     active_products = catalog(tuple(shop_ids), ("published", "unlisted", "archived"))
     draft_products = catalog(tuple(shop_ids), ("draft",))
@@ -1704,8 +3710,15 @@ def seller_workspace(user_id: str) -> dict:
             "price": str(product["price"]),
             "category": product["category"],
             "stock": str(product["stock"]),
+            "weightGrams": str(product["weightGrams"]) if product["weightGrams"] is not None else "",
+            "dimensions": product["dimensions"] or "",
             "lowStockThreshold": str(product["lowStockThreshold"]),
             "description": product["description"],
+            "craftsmanship": product.get("craftsmanship") or "",
+            "buyerTitle": product.get("buyerTitle") or "",
+            "buyerDescription": product.get("buyerDescription") or "",
+            "buyerMaterial": product.get("buyerMaterial") or "",
+            "buyerSeoTags": product.get("buyerSeoTags") or [],
             "images": product["images"] or [],
             "video": product["video"] or "",
             "seoTags": product["seoTags"],
@@ -1828,6 +3841,8 @@ def save_seller_product(user_id: str, product: dict, status: str) -> dict:
         existing = connection.execute("SELECT shop_id FROM products WHERE id = ?", (product_id,)).fetchone()
         if existing and existing[0] not in shop_ids:
             raise ValueError("无权编辑该作品")
+        resolve_product_media_assets(connection, user_id, product_id, product, status, bool(existing))
+        resolve_product_variant_media_assets(connection, user_id, product, status)
         upsert_product(connection, product_id, shop_id, product, status)
         audit_delegated_shop_operation(connection, user_id, shop_id, "product_saved", {"productId": product_id, "status": status})
     return seller_product_response(user_id, product_id)
@@ -1847,6 +3862,32 @@ def update_seller_shop(user_id: str, shop: dict) -> dict:
         shipping = shop.get("shippingTemplate")
         coupons = shop.get("coupons")
         featured = shop.get("featuredProductIds")
+        brand_site = shop.get("brandSite")
+        return_policy = shop.get("returnPolicy")
+        try:
+            current_settings = json.loads(current["settings_json"] or "{}")
+        except json.JSONDecodeError:
+            current_settings = {}
+        if not isinstance(current_settings, dict):
+            current_settings = {}
+        if isinstance(featured, list):
+            current_settings["featuredProductIds"] = featured_product_ids_for_shop(connection, shop_id, featured)
+        if isinstance(brand_site, dict):
+            current_settings["brandSite"] = brand_site
+        if isinstance(return_policy, dict):
+            try:
+                return_window_days = int(return_policy.get("windowDays", 7))
+            except (TypeError, ValueError):
+                return_window_days = 7
+            if not 1 <= return_window_days <= 30:
+                raise ValueError("退货期限需在 1 至 30 天之间")
+            return_address = str(return_policy.get("address") or "").strip()
+            recipient_name = str(return_policy.get("recipientName") or "").strip()
+            recipient_phone = str(return_policy.get("recipientPhone") or "").strip()
+            return_instructions = str(return_policy.get("instructions") or "").strip()
+            if len(recipient_name) > 80 or len(recipient_phone) > 40 or len(return_address) > 300 or len(return_instructions) > 500:
+                raise ValueError("退货设置内容过长")
+            current_settings["returnPolicy"] = {"acceptsReturns": bool(return_policy.get("acceptsReturns")), "windowDays": return_window_days, "recipientName": recipient_name, "recipientPhone": recipient_phone, "address": return_address, "instructions": return_instructions}
         connection.execute(
             """
             UPDATE shops
@@ -1861,9 +3902,9 @@ def update_seller_shop(user_id: str, shop: dict) -> dict:
                 shop.get("banner", current["banner_url"]),
                 shop.get("avatar", current["avatar_url"]),
                 shop.get("status") if shop.get("status") in ("active", "paused", "closed") else current["status"],
-                json.dumps(shipping if isinstance(shipping, dict) else json.loads(current["shipping_template_json"] or "{}"), ensure_ascii=False),
+                json.dumps(normalize_shipping_template(shipping) if isinstance(shipping, dict) else normalize_shipping_template(json.loads(current["shipping_template_json"] or "{}")), ensure_ascii=False),
                 json.dumps(coupons if isinstance(coupons, list) else json.loads(current["coupons_json"] or "[]"), ensure_ascii=False),
-                json.dumps({"featuredProductIds": featured if isinstance(featured, list) else json.loads(current["settings_json"] or "{}").get("featuredProductIds", [])}, ensure_ascii=False),
+                json.dumps(current_settings, ensure_ascii=False),
                 shop_id,
             ),
         )
@@ -1874,7 +3915,7 @@ def order_items_for_response(connection: sqlite3.Connection, order_id: str) -> l
     rows = connection.execute(
         """
         SELECT order_items.product_id, order_items.title_snapshot, order_items.image_url_snapshot,
-               order_items.unit_price_cents, order_items.quantity, order_items.specifications_snapshot,
+               order_items.unit_price_cents, order_items.price_currency, order_items.quantity, order_items.specifications_snapshot,
                activity_order_allocations.status AS activity_status,
                platform_activities.id AS activity_id, platform_activities.name AS activity_name
         FROM order_items
@@ -1892,6 +3933,7 @@ def order_items_for_response(connection: sqlite3.Connection, order_id: str) -> l
             "title": row["title_snapshot"],
             "image": row["image_url_snapshot"],
             "unitPrice": row["unit_price_cents"] / 100,
+            "currency": row["price_currency"],
             "quantity": row["quantity"],
             "variants": json.loads(row["specifications_snapshot"] or "{}"),
             "activity": (
@@ -1914,6 +3956,8 @@ def address_for_response(row: sqlite3.Row) -> dict:
         "district": row["district"],
         "detail": row["detail"],
         "postalCode": row["postal_code"] or "",
+        "countryCode": row["country_code"] or "US",
+        "country": row["country_name"] or SHIPPING_COUNTRIES.get(row["country_code"] or "US", "United States"),
         "isDefault": bool(row["is_default"]),
     }
 
@@ -2199,6 +4243,7 @@ def search_catalog(keyword: str, category: str, sort: str, terms: list[str] | No
     keyword = normalize_search_term(keyword)
     with database() as connection:
         connection.row_factory = sqlite3.Row
+        ensure_product_codes(connection)
         where, params = ["products.status = 'published'"], []
         if category and category != "全部":
             where.append("products.category = ?")
@@ -2206,7 +4251,9 @@ def search_catalog(keyword: str, category: str, sort: str, terms: list[str] | No
         search_terms = semantic_expanded_terms(list(dict.fromkeys(normalize_search_term(term) for term in (terms or [keyword]) if normalize_search_term(term)))[:12])
         rows = connection.execute(
             f"""
-            SELECT products.id, products.title, products.description, products.material, products.category,
+            SELECT products.id, products.product_code, products.title, products.description, products.material,
+                   products.buyer_title, products.buyer_description, products.buyer_material, products.buyer_seo_tags_json,
+                   products.category,
                    shops.name AS shop_name, products.price_cents, products.published_at,
                    COALESCE(GROUP_CONCAT(product_seo_tags.tag, ' '), '') AS tags,
                    COALESCE((SELECT SUM(order_items.quantity) FROM order_items JOIN orders ON orders.id = order_items.order_id WHERE order_items.product_id = products.id AND orders.status NOT IN ('cancelled', 'refunded', 'pending_payment')), 0) AS sales
@@ -2220,24 +4267,46 @@ def search_catalog(keyword: str, category: str, sort: str, terms: list[str] | No
         ).fetchall()
         preferred_categories, preferred_tags = search_preference_profile(connection, user_id)
     def score(row: sqlite3.Row) -> float:
-        title, description, material, product_category, shop, tags = (str(row[key] or "").lower() for key in ("title", "description", "material", "category", "shop_name", "tags"))
+        code, title, description, material, buyer_title, buyer_description, buyer_material, buyer_tags, product_category, shop, tags = (
+            str(row[key] or "").lower()
+            for key in (
+                "product_code", "title", "description", "material", "buyer_title",
+                "buyer_description", "buyer_material", "buyer_seo_tags_json",
+                "category", "shop_name", "tags",
+            )
+        )
         value = min(int(row["sales"] or 0), 100) * 0.18
         for term in search_terms:
+            if code == term:
+                value += 180
+            elif term in code:
+                value += 80
             if title == term:
                 value += 150
             elif title.startswith(term):
                 value += 92
             elif term in title:
                 value += 56
+            if buyer_title == term:
+                value += 150
+            elif buyer_title.startswith(term):
+                value += 92
+            elif term in buyer_title:
+                value += 56
             if term in tags:
                 value += 38
-            if term in product_category or term in material:
+            if term in buyer_tags:
+                value += 38
+            if term in product_category or term in material or term in buyer_material:
                 value += 27
-            if term in description:
+            if term in description or term in buyer_description:
                 value += 14
             if term in shop:
                 value += 9
-        semantic_text = " ".join((title, description, material, product_category, shop, tags))
+        semantic_text = " ".join((
+            code, title, description, material, buyer_title, buyer_description,
+            buyer_material, buyer_tags, product_category, shop, tags,
+        ))
         value += max((semantic_similarity(term, semantic_text) for term in search_terms), default=0) * 45
         value += preferred_categories.get(product_category, 0) * 2
         value += sum(preferred_tags.get(tag, 0) for tag in tags.split())
@@ -2255,7 +4324,20 @@ def search_catalog(keyword: str, category: str, sort: str, terms: list[str] | No
         records.sort(key=lambda row: (score(row), int(row["sales"] or 0), str(row["published_at"] or "")), reverse=True)
     # Preserve strict keyword behavior for exact sorts, while allowing semantic recall for relevance.
     if search_terms and sort != "relevance":
-        records = [row for row in records if any(term in " ".join(str(row[key] or "").lower() for key in ("title", "description", "material", "category", "shop_name", "tags")) for term in search_terms)]
+        records = [
+            row for row in records
+            if any(
+                term in " ".join(
+                    str(row[key] or "").lower()
+                    for key in (
+                        "product_code", "title", "description", "material", "buyer_title",
+                        "buyer_description", "buyer_material", "buyer_seo_tags_json",
+                        "category", "shop_name", "tags",
+                    )
+                )
+                for term in search_terms
+            )
+        ]
     items = {item["catalogId"]: item for item in catalog()}
     return [items[row["id"]] for row in records[:60] if row["id"] in items and (not search_terms or score(row) > 0)]
 
@@ -2275,7 +4357,10 @@ def search_suggestions(connection: sqlite3.Connection, keyword: str, user_id: st
         for row in connection.execute("SELECT keyword FROM search_history WHERE user_id = ? AND (? = '' OR lower(keyword) LIKE ?) GROUP BY keyword ORDER BY MAX(created_at) DESC LIMIT 5", (user_id, term, f"%{term}%")):
             add(row[0], "history", "最近搜索")
     if term:
-        for row in connection.execute("SELECT title FROM products WHERE status = 'published' AND lower(title) LIKE ? ORDER BY published_at DESC LIMIT 5", (f"%{term}%",)):
+        for row in connection.execute(
+            "SELECT CASE WHEN TRIM(buyer_title) != '' THEN buyer_title ELSE title END AS title FROM products WHERE status = 'published' AND (lower(title) LIKE ? OR lower(buyer_title) LIKE ?) ORDER BY published_at DESC LIMIT 5",
+            (f"%{term}%", f"%{term}%"),
+        ):
             add(row[0], "product", "作品")
         for row in connection.execute("SELECT DISTINCT tag FROM product_seo_tags WHERE lower(tag) LIKE ? LIMIT 5", (f"%{term}%",)):
             add(row[0], "tag", "标签")
@@ -2303,7 +4388,7 @@ def search_operations(connection: sqlite3.Connection, keyword: str) -> dict:
 def search_operations_payload(connection: sqlite3.Connection, days: int = 30) -> dict:
     """Return search configuration and query metrics for the operations console."""
     connection.row_factory = sqlite3.Row
-    days = 7 if days == 7 else 30
+    days = days if days in (1, 7, 30) else 30
     since = f"-{days} days"
     synonym_rows = connection.execute("SELECT * FROM search_synonyms ORDER BY updated_at DESC LIMIT 100").fetchall()
     correction_rows = connection.execute("SELECT * FROM search_corrections ORDER BY updated_at DESC LIMIT 100").fetchall()
@@ -2370,21 +4455,173 @@ def platform_campaign_for_charge(connection: sqlite3.Connection, buyer_user_id: 
     return max(eligible, key=lambda item: item["discount"], default=None)
 
 
-def shop_charge(connection: sqlite3.Connection, shop_id: str, buyer_user_id: str, item_amount: int, quantity: int, provisional_usage: dict[str, tuple[int, int]] | None = None) -> tuple[int, int, dict | None]:
+def shop_promotion_is_current(promotion: dict) -> bool:
+    if promotion.get("type") != "limited_time":
+        return True
+    try:
+        now = datetime.now()
+        starts_at = datetime.fromisoformat(str(promotion.get("startsAt") or ""))
+        ends_at = datetime.fromisoformat(str(promotion.get("endsAt") or ""))
+        return starts_at <= now <= ends_at
+    except (TypeError, ValueError):
+        return False
+
+
+def shop_promotion_discount(promotion: dict, item_amount: int) -> int:
+    try:
+        threshold = max(0, int(round(number(promotion.get("threshold")) * 100)))
+        if item_amount < threshold or not shop_promotion_is_current(promotion):
+            return 0
+        if promotion.get("type") == "full_discount":
+            rate = number(promotion.get("rate"))
+            if rate <= 0 or rate > 10:
+                return 0
+            return max(0, int(round(item_amount * (10 - rate) / 10)))
+        return max(0, int(round(number(promotion.get("discount")) * 100)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def shipping_amount_cents(value: object, field: str) -> int:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"配送规则的{field}无效")
+    if not math.isfinite(amount) or amount < 0 or amount > 100000:
+        raise ValueError(f"配送规则的{field}必须在 0 到 100000 美元之间")
+    return int(round(amount * 100))
+
+
+def shipping_text(value: object, field: str, limit: int = 80) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > limit:
+        raise ValueError(f"配送规则的{field}不能为空且不能超过 {limit} 个字符")
+    return text
+
+
+def default_shipping_template(template: dict) -> dict:
+    """Convert the previous single-rate template into safe international defaults."""
+    first_fee = max(0, number(template.get("firstFee")))
+    additional_fee = max(0, number(template.get("additionalFee")))
+    free_threshold = max(0, number(template.get("freeShippingThreshold")))
+    carrier = str(template.get("carrier") or "顺丰国际").strip() or "顺丰国际"
+    return {
+        "name": str(template.get("name") or "国际配送")[:80] or "国际配送",
+        "currency": PLATFORM_CURRENCY,
+        "zones": [
+            {
+                "id": "north-america", "name": "北美地区", "countries": list(DEFAULT_NORTH_AMERICA_COUNTRIES),
+                "carrier": carrier, "firstFee": first_fee, "additionalFee": additional_fee,
+                "freeShippingThreshold": free_threshold, "minDeliveryDays": 7, "maxDeliveryDays": 12, "enabled": True,
+            },
+            {
+                "id": "europe", "name": "欧洲地区", "countries": list(DEFAULT_EUROPE_COUNTRIES),
+                "carrier": carrier, "firstFee": first_fee, "additionalFee": additional_fee,
+                "freeShippingThreshold": free_threshold, "minDeliveryDays": 8, "maxDeliveryDays": 16, "enabled": True,
+            },
+        ],
+        # Kept for API clients that have not yet upgraded to zone rendering.
+        "firstFee": first_fee, "additionalFee": additional_fee, "freeShippingThreshold": free_threshold,
+    }
+
+
+def normalize_shipping_template(template: object) -> dict:
+    if not isinstance(template, dict):
+        raise ValueError("运费模板必须是对象")
+    raw_zones = template.get("zones")
+    if not isinstance(raw_zones, list):
+        return default_shipping_template(template)
+    if not raw_zones or len(raw_zones) > 8:
+        raise ValueError("请设置 1 到 8 个配送区域")
+    zones = []
+    used_ids: set[str] = set()
+    enabled_countries: set[str] = set()
+    for index, raw_zone in enumerate(raw_zones):
+        if not isinstance(raw_zone, dict):
+            raise ValueError("配送区域格式无效")
+        zone_id = str(raw_zone.get("id") or f"zone-{index + 1}").strip().lower()
+        if not re.fullmatch(r"[a-z0-9-]{1,40}", zone_id) or zone_id in used_ids:
+            raise ValueError("配送区域标识无效或重复")
+        used_ids.add(zone_id)
+        countries = []
+        for country in raw_zone.get("countries") or []:
+            code = str(country or "").strip().upper()
+            if code not in SHIPPING_COUNTRIES or code in countries:
+                raise ValueError("配送国家仅支持当前开放的北美和欧洲国家，且不能重复")
+            countries.append(code)
+        if not countries:
+            raise ValueError("每个配送区域至少选择一个目的国家")
+        enabled = bool(raw_zone.get("enabled", True))
+        if enabled and enabled_countries.intersection(countries):
+            raise ValueError("同一目的国家不能同时属于多个已启用配送区域")
+        if enabled:
+            enabled_countries.update(countries)
+        try:
+            min_days = int(raw_zone.get("minDeliveryDays", 7))
+            max_days = int(raw_zone.get("maxDeliveryDays", 14))
+        except (TypeError, ValueError):
+            raise ValueError("预计送达时效必须是整数天")
+        if not (1 <= min_days <= max_days <= 90):
+            raise ValueError("预计送达时效必须在 1 到 90 天之间，且最短不大于最长")
+        zones.append({
+            "id": zone_id,
+            "name": shipping_text(raw_zone.get("name"), "区域名称"),
+            "countries": countries,
+            "carrier": shipping_text(raw_zone.get("carrier") or "SF International", "物流商"),
+            "firstFee": shipping_amount_cents(raw_zone.get("firstFee", 0), "首件运费") / 100,
+            "additionalFee": shipping_amount_cents(raw_zone.get("additionalFee", 0), "续件运费") / 100,
+            "freeShippingThreshold": shipping_amount_cents(raw_zone.get("freeShippingThreshold", 0), "免邮门槛") / 100,
+            "minDeliveryDays": min_days, "maxDeliveryDays": max_days, "enabled": enabled,
+        })
+    first_zone = zones[0]
+    return {
+        "name": shipping_text(template.get("name") or "国际配送", "模板名称"),
+        "currency": PLATFORM_CURRENCY,
+        "zones": zones,
+        "firstFee": first_zone["firstFee"], "additionalFee": first_zone["additionalFee"],
+        "freeShippingThreshold": first_zone["freeShippingThreshold"],
+    }
+
+
+def shipping_quote_for_destination(template: object, country_code: str, item_amount: int, quantity: int) -> dict:
+    normalized = normalize_shipping_template(template)
+    country_code = str(country_code or "").strip().upper()
+    zone = next((item for item in normalized["zones"] if item["enabled"] and country_code in item["countries"]), None)
+    if not zone:
+        destination = SHIPPING_COUNTRIES.get(country_code, country_code or "the selected destination")
+        raise ValueError(f"该店铺暂不配送至 {destination}，请更换地址或移除该店商品")
+    first_fee = int(round(zone["firstFee"] * 100))
+    additional_fee = int(round(zone["additionalFee"] * 100))
+    threshold = int(round(zone["freeShippingThreshold"] * 100))
+    shipping_amount = 0 if threshold and item_amount >= threshold else first_fee + max(0, quantity - 1) * additional_fee
+    return {
+        "zoneId": zone["id"], "zoneName": zone["name"], "carrier": zone["carrier"],
+        "minDeliveryDays": zone["minDeliveryDays"], "maxDeliveryDays": zone["maxDeliveryDays"],
+        "destinationCountryCode": country_code, "destinationCountry": SHIPPING_COUNTRIES[country_code],
+        "firstFee": zone["firstFee"], "additionalFee": zone["additionalFee"],
+        "freeShippingThreshold": zone["freeShippingThreshold"], "shippingAmountCents": shipping_amount,
+        "currency": PLATFORM_CURRENCY,
+    }
+
+
+def shop_charge(connection: sqlite3.Connection, shop_id: str, buyer_user_id: str, item_amount: int, quantity: int, country_code: str, provisional_usage: dict[str, tuple[int, int]] | None = None) -> tuple[int, int, dict | None, dict]:
     shop = connection.execute(
         "SELECT shipping_template_json, coupons_json FROM shops WHERE id = ?", (shop_id,)
     ).fetchone()
-    shipping = json.loads(shop["shipping_template_json"] or "{}") if shop else {}
-    first_fee = max(0, int(round(number(shipping.get("firstFee")) * 100)))
-    additional_fee = max(0, int(round(number(shipping.get("additionalFee")) * 100)))
-    free_threshold = number(shipping.get("freeShippingThreshold"))
-    shipping_amount = 0 if free_threshold and item_amount >= int(round(free_threshold * 100)) else first_fee + max(0, quantity - 1) * additional_fee
-    coupons = json.loads(shop["coupons_json"] or "[]") if shop else []
-    eligible = [coupon for coupon in coupons if item_amount >= int(round(number(coupon.get("threshold")) * 100))]
-    discount = max((int(round(number(coupon.get("discount")) * 100)) for coupon in eligible), default=0)
+    try:
+        shipping = json.loads(shop["shipping_template_json"] or "{}") if shop else {}
+    except json.JSONDecodeError:
+        shipping = {}
+    shipping_rule = shipping_quote_for_destination(shipping, country_code, item_amount, quantity)
+    shipping_amount = shipping_rule["shippingAmountCents"]
+    try:
+        coupons = json.loads(shop["coupons_json"] or "[]") if shop else []
+    except json.JSONDecodeError:
+        coupons = []
+    discount = max((shop_promotion_discount(promotion, item_amount) for promotion in coupons if isinstance(promotion, dict)), default=0)
     campaign = platform_campaign_for_charge(connection, buyer_user_id, item_amount, provisional_usage)
     discount += campaign["discount"] if campaign else 0
-    return shipping_amount, min(discount, item_amount + shipping_amount), campaign
+    return shipping_amount, min(discount, item_amount + shipping_amount), campaign, shipping_rule
 
 
 def record_order_resource_event(
@@ -2655,12 +4892,197 @@ class OrderExpiryWorker(threading.Thread):
             with database() as connection:
                 expire_ended_activities(connection)
                 run_support_automation(connection)
+            run_seller_message_automation()
             self.stop_event.wait(self.interval_seconds)
+
+
+def message_display_time(value: object) -> str:
+    """Render UTC SQLite message timestamps in the marketplace's local time."""
+    raw = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return raw
+
+
+DEFAULT_MESSAGE_WEEKLY_HOURS = {
+    "mon": [{"start": "09:00", "end": "18:00"}],
+    "tue": [{"start": "09:00", "end": "18:00"}],
+    "wed": [{"start": "09:00", "end": "18:00"}],
+    "thu": [{"start": "09:00", "end": "18:00"}],
+    "fri": [{"start": "09:00", "end": "18:00"}],
+    "sat": [],
+    "sun": [],
+}
+
+
+def normalise_message_weekly_hours(value: object) -> dict[str, list[dict[str, str]]]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, list[dict[str, str]]] = {}
+    for day in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
+        windows = source.get(day, DEFAULT_MESSAGE_WEEKLY_HOURS[day])
+        if not isinstance(windows, list):
+            windows = []
+        valid: list[dict[str, str]] = []
+        for window in windows[:2]:
+            if not isinstance(window, dict):
+                continue
+            start, end = str(window.get("start") or "").strip(), str(window.get("end") or "").strip()
+            if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", end) and start < end:
+                valid.append({"start": start, "end": end})
+        result[day] = valid
+    return result
+
+
+def message_settings_for_row(row: sqlite3.Row | None) -> dict[str, object]:
+    if not row:
+        return {
+            "timezone": "Asia/Shanghai", "weeklyHours": DEFAULT_MESSAGE_WEEKLY_HOURS,
+            "unansweredMinutes": 3, "offHoursAutoReplyEnabled": True,
+            "offHoursReplyTemplate": "店主当前处于非工作时间，已收到您的消息，请耐心等待，我们会在工作时间尽快回复您。",
+            "urgentEmailEnabled": True, "urgentSmsEnabled": False,
+            "unansweredEmailEnabled": True, "aiReplyEnabled": True,
+        }
+    try:
+        weekly = json.loads(row["weekly_hours_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        weekly = {}
+    timezone_name = str(row["timezone"] or "Asia/Shanghai")
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone_name = "Asia/Shanghai"
+    return {
+        "timezone": timezone_name, "weeklyHours": normalise_message_weekly_hours(weekly),
+        "unansweredMinutes": max(1, min(60, int(row["unanswered_minutes"] or 3))),
+        "offHoursAutoReplyEnabled": bool(row["off_hours_auto_reply_enabled"]),
+        "offHoursReplyTemplate": str(row["off_hours_reply_template"] or "")[:500],
+        "urgentEmailEnabled": bool(row["urgent_email_enabled"]), "urgentSmsEnabled": bool(row["urgent_sms_enabled"]),
+        "unansweredEmailEnabled": bool(row["unanswered_email_enabled"]), "aiReplyEnabled": bool(row["ai_reply_enabled"]),
+    }
+
+
+def shop_message_settings(connection: sqlite3.Connection, shop_id: str) -> dict[str, object]:
+    connection.row_factory = sqlite3.Row
+    row = connection.execute("SELECT * FROM seller_message_settings WHERE shop_id = ?", (shop_id,)).fetchone()
+    return message_settings_for_row(row)
+
+
+def message_working_now(settings: dict[str, object], now: datetime | None = None) -> bool:
+    current = now or datetime.now(timezone.utc)
+    try:
+        local = current.astimezone(ZoneInfo(str(settings.get("timezone") or "Asia/Shanghai")))
+    except ZoneInfoNotFoundError:
+        local = current.astimezone(timezone(timedelta(hours=8)))
+    day = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[local.weekday()]
+    minutes = local.hour * 60 + local.minute
+    for window in (settings.get("weeklyHours") or {}).get(day, []):
+        start_hour, start_minute = map(int, str(window["start"]).split(":"))
+        end_hour, end_minute = map(int, str(window["end"]).split(":"))
+        if start_hour * 60 + start_minute <= minutes < end_hour * 60 + end_minute:
+            return True
+    return False
+
+
+def classify_buyer_message(content: str) -> tuple[str, str, float]:
+    text = re.sub(r"\s+", " ", str(content or "").strip().lower())
+    urgent_groups = (
+        ("售后/退款/争议", ("退款", "退货", "争议", "拒付", "chargeback", "refund", "return", "dispute")),
+        ("订单取消或地址修改时限", ("取消订单", "取消订单", "改地址", "修改地址", "cancel order", "change address")),
+        ("支付或欺诈风险", ("支付失败", "付款失败", "欺诈", "诈骗", "fraud", "payment failed", "scam")),
+        ("物流异常或丢件", ("丢件", "未收到", "物流异常", "包裹破损", "missing parcel", "not received", "damaged")),
+        ("商品安全或人身风险", ("过敏", "受伤", "安全问题", "危险", "allergy", "injury", "unsafe")),
+    )
+    for reason, keywords in urgent_groups:
+        if any(keyword in text for keyword in keywords):
+            return "urgent", reason, 0.94
+    high_keywords = ("今天发货", "截止", "deadline", "where is my order", "订单到哪", "什么时候到", "tracking")
+    if any(keyword in text for keyword in high_keywords):
+        return "high", "买家询问时效或物流进度", 0.78
+    return "normal", "", 0.55
+
+
+def email_is_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_FROM)
+
+
+def send_seller_email(destination: str, subject: str, body: str) -> None:
+    if not email_is_configured() or not destination:
+        raise ValueError("SMTP email is not configured")
+    message = EmailMessage()
+    message["From"], message["To"], message["Subject"] = SMTP_FROM, destination, subject
+    message.set_content(body)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as client:
+        if SMTP_STARTTLS:
+            client.starttls()
+        if SMTP_USERNAME:
+            client.login(SMTP_USERNAME, SMTP_PASSWORD)
+        client.send_message(message)
+
+
+def dispatch_seller_message_notification(notification_id: str) -> None:
+    try:
+        with database() as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """SELECT n.*, u.email, u.phone, s.name AS shop_name, m.content, m.buyer_user_id,
+                          b.display_name AS buyer_name
+                   FROM seller_message_notifications n
+                   JOIN users u ON u.id = n.seller_user_id
+                   JOIN shops s ON s.id = n.shop_id
+                   JOIN shop_messages m ON m.id = n.message_id
+                   JOIN users b ON b.id = m.buyer_user_id
+                   WHERE n.id = ? AND n.status = 'queued' AND n.due_at <= CURRENT_TIMESTAMP""", (notification_id,)
+            ).fetchone()
+            if not row:
+                return
+            channel = row["channel"]
+            if channel == "email":
+                subject = "买家消息需要尽快处理" if row["notification_type"] == "urgent" else "买家消息超过 3 分钟未回复"
+                send_seller_email(row["email"], f"[{row['shop_name']}] {subject}", f"买家：{row['buyer_name']}\n消息：{row['content']}\n请登录店铺消息面板处理。")
+            elif channel == "sms":
+                template_id = TENCENT_SMS_TEMPLATES.get("seller_message_urgent")
+                if not TENCENT_SMS_ENABLED or not template_id:
+                    raise ValueError("SMS notification is not configured")
+                send_tencent_sms(row["phone"], template_id)
+            connection.execute("UPDATE seller_message_notifications SET status = 'sent', sent_at = CURRENT_TIMESTAMP, attempts = attempts + 1 WHERE id = ?", (notification_id,))
+    except Exception as error:
+        with database() as connection:
+            connection.execute("UPDATE seller_message_notifications SET status = 'failed', attempts = attempts + 1, last_error = ? WHERE id = ?", (str(error)[:300], notification_id))
+
+
+def queue_seller_message_notification(connection: sqlite3.Connection, message_id: str, shop_id: str, notification_type: str, channel: str, due_at: str | None = None, delay_minutes: int | None = None) -> str | None:
+    owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,)).fetchone()
+    if not owner:
+        return None
+    notification_id = f"seller-message-notice-{secrets.token_urlsafe(10)}"
+    due_expression = "datetime('now', ?)" if delay_minutes is not None else "COALESCE(?, CURRENT_TIMESTAMP)"
+    due_value: object = f"+{max(0, int(delay_minutes))} minutes" if delay_minutes is not None else due_at
+    inserted = connection.execute(
+        f"""INSERT OR IGNORE INTO seller_message_notifications
+           (id, message_id, shop_id, seller_user_id, notification_type, channel, due_at)
+           VALUES (?, ?, ?, ?, ?, ?, {due_expression})""",
+        (notification_id, message_id, shop_id, owner[0], notification_type, channel, due_value),
+    ).rowcount
+    return notification_id if inserted else None
+
+
+def mark_message_attention(connection: sqlite3.Connection, message_id: str, shop_id: str, buyer_user_id: str, priority: str, reason: str, confidence: float) -> None:
+    connection.execute(
+        """INSERT INTO seller_message_attention (message_id, shop_id, buyer_user_id, priority, reason, confidence)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(message_id) DO UPDATE SET priority = excluded.priority, reason = excluded.reason, confidence = excluded.confidence, updated_at = CURRENT_TIMESTAMP""",
+        (message_id, shop_id, buyer_user_id, priority, reason, max(0, min(1, confidence))),
+    )
 
 
 def message_row_for_response(row: sqlite3.Row) -> dict:
     message_type = row["message_type"] or "text"
     order = None
+    product = None
     if row["order_id"]:
         order = {
             "id": row["order_id"],
@@ -2670,12 +5092,22 @@ def message_row_for_response(row: sqlite3.Row) -> dict:
             "title": row["order_title"] or "订单作品",
             "image": row["order_image"],
         }
+    if row["product_id"]:
+        product = {
+            "id": row["product_id"],
+            "title": row["product_title"] or "Product",
+            "price": number(row["product_price"]) / 100,
+            "image": row["product_image"],
+        }
     return {
         "id": row["id"], "cursor": row["message_cursor"], "shopId": row["shop_id"], "shop": row["shop_name"],
         "buyerUserId": row["buyer_user_id"], "buyer": row["buyer_name"],
         "sender": row["sender_role"], "senderUserId": row["sender_user_id"], "type": message_type, "content": row["content"],
-        "attachmentUrl": row["attachment_url"], "order": order,
-        "read": bool(row["read_at"]), "createdAt": row["created_at"],
+        "attachmentUrl": row["attachment_url"], "order": order, "product": product,
+        "read": bool(row["read_at"]), "createdAt": message_display_time(row["created_at"]),
+        "automationKind": row["automation_kind"],
+        "priority": row["attention_priority"] or "normal",
+        "priorityReason": row["attention_reason"] or "",
     }
 
 
@@ -2688,11 +5120,17 @@ def message_rows(connection: sqlite3.Connection, where: str, params: tuple[objec
                shops.name AS shop_name, users.display_name AS buyer_name,
                orders.order_no, orders.status AS order_status, orders.paid_amount_cents AS order_amount,
                (SELECT title_snapshot FROM order_items WHERE order_items.order_id = orders.id ORDER BY rowid LIMIT 1) AS order_title,
-               (SELECT image_url_snapshot FROM order_items WHERE order_items.order_id = orders.id ORDER BY rowid LIMIT 1) AS order_image
+               (SELECT image_url_snapshot FROM order_items WHERE order_items.order_id = orders.id ORDER BY rowid LIMIT 1) AS order_image,
+               products.title AS product_title, products.price_cents AS product_price,
+               (SELECT public_url FROM product_media WHERE product_media.product_id = products.id AND product_media.media_type = 'image' ORDER BY sort_order LIMIT 1) AS product_image,
+               seller_message_attention.priority AS attention_priority,
+               seller_message_attention.reason AS attention_reason
         FROM shop_messages
         JOIN shops ON shops.id = shop_messages.shop_id
         JOIN users ON users.id = shop_messages.buyer_user_id
         LEFT JOIN orders ON orders.id = shop_messages.order_id
+        LEFT JOIN products ON products.id = shop_messages.product_id
+        LEFT JOIN seller_message_attention ON seller_message_attention.message_id = shop_messages.id
         WHERE {where}
         ORDER BY shop_messages.rowid {direction}
         """,
@@ -2705,6 +5143,8 @@ def conversation_preview(message: dict) -> str:
         return "[图片]"
     if message["type"] == "order":
         return f"订单卡片：{message['order']['orderNo'] if message.get('order') else '订单'}"
+    if message.get("product"):
+        return f"商品卡片：{message['product']['title']}"
     return message["content"][:80]
 
 
@@ -2807,7 +5247,7 @@ def seller_messages_payload(connection: sqlite3.Connection, user_id: str, shop_i
         message = message_row_for_response(row)
         key = (str(message["shopId"]), str(message["buyerUserId"]))
         if key not in conversations:
-            conversations[key] = {"shopId": message["shopId"], "shop": message["shop"], "buyerUserId": message["buyerUserId"], "buyer": message["buyer"], "preview": conversation_preview(message), "lastMessageAt": message["createdAt"], "unread": 0}
+            conversations[key] = {"shopId": message["shopId"], "shop": message["shop"], "buyerUserId": message["buyerUserId"], "buyer": message["buyer"], "preview": conversation_preview(message), "lastMessageAt": message["createdAt"], "unread": 0, "priority": message.get("priority", "normal"), "priorityReason": message.get("priorityReason", "")}
         if message["sender"] == "buyer" and not message["read"]:
             conversations[key]["unread"] += 1
     messages: list[dict] = []
@@ -2817,6 +5257,139 @@ def seller_messages_payload(connection: sqlite3.Connection, user_id: str, shop_i
         connection.execute("UPDATE shop_messages SET read_at = CURRENT_TIMESTAMP WHERE shop_id = ? AND buyer_user_id = ? AND sender_role = 'buyer' AND read_at IS NULL", (shop_id, buyer_id))
         messages = [message_row_for_response(row) for row in message_rows(connection, "shop_messages.shop_id = ? AND shop_messages.buyer_user_id = ?", (shop_id, buyer_id))]
     return {"conversations": list(conversations.values()), "messages": messages}
+
+
+def apply_buyer_message_automation(connection: sqlite3.Connection, message_id: str, shop_id: str, buyer_user_id: str, content: str) -> dict[str, object]:
+    """Classify an inbound buyer message and persist safe acknowledgement/escalation work.
+
+    This function never lets AI or keyword matching approve refunds, price changes,
+    or delivery promises.  Off-hours acknowledgements are fixed seller-controlled
+    templates; anything urgent is escalated for a person to handle.
+    """
+    settings = shop_message_settings(connection, shop_id)
+    priority, reason, confidence = classify_buyer_message(content)
+    recipients = shop_message_recipient_user_ids(connection, shop_id)
+    owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,)).fetchone()
+    owner_id = owner[0] if owner else None
+    auto_reply_id: str | None = None
+
+    if priority in ("high", "urgent"):
+        mark_message_attention(connection, message_id, shop_id, buyer_user_id, priority, reason, confidence)
+        for recipient in recipients:
+            notify_governance(connection, recipient, "buyer_message_urgent", "买家消息需要尽快处理", reason or "请尽快查看买家消息", "shop_message", message_id)
+        if owner_id and bool(settings["urgentEmailEnabled"]):
+            queue_seller_message_notification(connection, message_id, shop_id, "urgent", "email")
+        if priority == "urgent" and owner_id and bool(settings["urgentSmsEnabled"]):
+            queue_seller_message_notification(connection, message_id, shop_id, "urgent", "sms")
+
+    if bool(settings["unansweredEmailEnabled"]) and owner_id and message_working_now(settings):
+        queue_seller_message_notification(
+            connection, message_id, shop_id, "unanswered", "email",
+            delay_minutes=int(settings["unansweredMinutes"]),
+        )
+
+    if bool(settings["offHoursAutoReplyEnabled"]) and not message_working_now(settings):
+        recent = connection.execute(
+            """SELECT 1 FROM shop_messages WHERE shop_id = ? AND buyer_user_id = ?
+               AND sender_role = 'seller' AND automation_kind = 'off_hours'
+               AND created_at >= datetime('now', '-12 hours') LIMIT 1""",
+            (shop_id, buyer_user_id),
+        ).fetchone()
+        if not recent:
+            auto_reply_id = f"message-{secrets.token_urlsafe(10)}"
+            template = str(settings["offHoursReplyTemplate"]).strip()[:500]
+            connection.execute(
+                """INSERT INTO shop_messages
+                   (id, shop_id, buyer_user_id, sender_role, sender_user_id, content, message_type, automation_kind)
+                   VALUES (?, ?, ?, 'seller', ?, ?, 'text', 'off_hours')""",
+                (auto_reply_id, shop_id, buyer_user_id, owner_id, template),
+            )
+            notify_governance(connection, buyer_user_id, "seller_message", "店铺已收到你的消息", template[:80], "shop", shop_id)
+    return {"priority": priority, "reason": reason, "autoReplyMessageId": auto_reply_id, "recipientUserIds": recipients}
+
+
+def run_seller_message_automation() -> int:
+    """Deliver due unattended-message reminders and avoid notifying after a reply."""
+    with database() as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """SELECT n.id, n.notification_type, n.message_id, m.shop_id, m.buyer_user_id, m.created_at
+               FROM seller_message_notifications n
+               JOIN shop_messages m ON m.id = n.message_id
+               WHERE n.status = 'queued' AND n.due_at <= CURRENT_TIMESTAMP
+               ORDER BY n.created_at LIMIT 50"""
+        ).fetchall()
+        ready: list[str] = []
+        for row in rows:
+            if row["notification_type"] == "unanswered":
+                settings = shop_message_settings(connection, row["shop_id"])
+                if not message_working_now(settings):
+                    connection.execute("UPDATE seller_message_notifications SET status = 'skipped', sent_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+                    continue
+                replied = connection.execute(
+                    """SELECT 1 FROM shop_messages WHERE shop_id = ? AND buyer_user_id = ?
+                       AND sender_role = 'seller' AND automation_kind IS NULL AND created_at > ? LIMIT 1""",
+                    (row["shop_id"], row["buyer_user_id"], row["created_at"]),
+                ).fetchone()
+                newer_buyer_message = connection.execute(
+                    """SELECT 1 FROM shop_messages WHERE shop_id = ? AND buyer_user_id = ?
+                       AND sender_role = 'buyer' AND created_at > ? LIMIT 1""",
+                    (row["shop_id"], row["buyer_user_id"], row["created_at"]),
+                ).fetchone()
+                if replied or newer_buyer_message:
+                    connection.execute("UPDATE seller_message_notifications SET status = 'skipped', sent_at = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+                    continue
+                owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (row["shop_id"],)).fetchone()
+                if owner:
+                    notify_governance(connection, owner[0], "buyer_message_unanswered", "买家消息等待回复", "一条工作时间内的买家消息超过设定时间未回复。", "shop_message", row["message_id"])
+            ready.append(row["id"])
+    for notification_id in ready:
+        dispatch_seller_message_notification(notification_id)
+    return len(ready)
+
+
+def seller_ai_message_draft(connection: sqlite3.Connection, user_id: str, shop_id: str, buyer_user_id: str) -> str:
+    settings = shop_message_settings(connection, shop_id)
+    if not bool(settings["aiReplyEnabled"]):
+        raise ValueError("店铺未启用 AI 回复建议")
+    require_shop_permission(connection, user_id, shop_id, "messages")
+    if not OPENAI_API_KEY:
+        raise ValueError("AI 服务尚未配置")
+    if not seller_ai_assistant_rate_allowed(user_id):
+        raise ValueError("AI 请求过于频繁，请 10 分钟后再试")
+    rows = connection.execute(
+        """SELECT sender_role, content, message_type, created_at FROM shop_messages
+           WHERE shop_id = ? AND buyer_user_id = ? ORDER BY rowid DESC LIMIT 12""",
+        (shop_id, buyer_user_id),
+    ).fetchall()
+    if not rows or not any(row["sender_role"] == "buyer" for row in rows):
+        raise ValueError("当前会话没有可回复的买家消息")
+    history = [
+        {"role": "user" if row["sender_role"] == "buyer" else "assistant", "content": str(row["content"] or "")[:500] or f"[{row['message_type']}]"}
+        for row in reversed(rows)
+    ]
+    request_body = {
+        "model": OPENAI_MODEL, "temperature": 0.25, "max_tokens": 360,
+        "messages": [
+            {"role": "system", "content": "你是跨境电商卖家的客服文案助手。仅根据对话中明确的信息起草一条简洁、礼貌的回复，可使用中文。不得承诺退款、赔偿、改价、库存、发货或到货日期；涉及付款、退款、纠纷、地址修改、商品安全、投诉时，只说明将优先核实并由人工处理。不要声称自己是 AI，不要添加标题或解释。"},
+            *history,
+            {"role": "user", "content": "请起草下一条卖家回复，供卖家审核后手动发送。"},
+        ],
+    }
+    request = Request(
+        seller_ai_assistant_endpoint(), data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urlopen(request, timeout=35) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise ValueError("AI 回复建议暂时无法生成，请稍后重试") from error
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    draft = str(choices[0].get("message", {}).get("content") or "").strip() if isinstance(choices, list) and choices else ""
+    if not draft:
+        raise ValueError("AI 未返回有效回复建议")
+    return draft[:500]
 
 
 def support_sla_hours(priority: str) -> tuple[int, int]:
@@ -2909,6 +5482,8 @@ def run_support_automation(connection: sqlite3.Connection) -> int:
 def support_ticket_access(connection: sqlite3.Connection, ticket: sqlite3.Row, user_id: str, audience: str) -> str | None:
     if audience == "buyer" and ticket["buyer_user_id"] == user_id:
         return "buyer"
+    if audience == "platform_seller" and ticket["buyer_user_id"] == user_id and ticket["requester_role"] == "seller":
+        return "seller"
     if audience == "seller" and ticket["shop_id"] and "messages" in seller_shop_permissions(connection, user_id).get(ticket["shop_id"], set()):
         return "seller"
     if audience == "admin" and is_admin(connection, user_id):
@@ -2939,7 +5514,9 @@ def support_tickets_for(connection: sqlite3.Connection, user_id: str, audience: 
     connection.row_factory = sqlite3.Row
     run_support_automation(connection)
     if audience == "buyer":
-        rows = connection.execute("SELECT * FROM support_tickets WHERE buyer_user_id = ? ORDER BY updated_at DESC", (user_id,)).fetchall()
+        rows = connection.execute("SELECT * FROM support_tickets WHERE buyer_user_id = ? AND requester_role = 'buyer' ORDER BY updated_at DESC", (user_id,)).fetchall()
+    elif audience == "platform_seller":
+        rows = connection.execute("SELECT * FROM support_tickets WHERE buyer_user_id = ? AND requester_role = 'seller' ORDER BY updated_at DESC", (user_id,)).fetchall()
     elif audience == "seller":
         shop_ids = seller_accessible_shop_ids(connection, user_id, "messages")
         if not shop_ids:
@@ -2964,7 +5541,7 @@ def orders_for_response(connection: sqlite3.Connection, where: str, params: tupl
             (order["id"],),
         ).fetchone()
         payment = connection.execute(
-            "SELECT payment_method, status, provider_reference, paid_at, initiated_at, failure_reason FROM payment_transactions WHERE order_id = ?",
+            "SELECT payment_method, payment_currency, exchange_rate, status, provider_reference, paid_at, initiated_at, failure_reason FROM payment_transactions WHERE order_id = ?",
             (order["id"],),
         ).fetchone()
         shipment = connection.execute(
@@ -3018,13 +5595,21 @@ def orders_for_response(connection: sqlite3.Connection, where: str, params: tupl
                 "expiresAt": order["expires_at"],
                 "itemAmount": order["item_amount_cents"] / 100,
                 "shippingAmount": order["shipping_amount_cents"] / 100,
+                "shippingRule": json.loads(order["shipping_rule_snapshot_json"] or "{}"),
                 "discountAmount": order["discount_amount_cents"] / 100,
                 "platformCampaign": ({"id": campaign["id"], "name": campaign["name"], "discountAmount": campaign["discount_amount_cents"] / 100, "status": campaign["status"]} if campaign else None),
                 "resourceEvents": resource_events,
                 "amount": order["paid_amount_cents"] / 100,
+                "currency": order["pricing_currency"],
+                "paymentCurrency": order["payment_currency"],
+                "settlementCurrency": order["settlement_currency"],
+                "paymentExchangeRate": order["payment_exchange_rate"],
+                "settlementExchangeRate": order["settlement_exchange_rate"],
                 "payment": (
                     {
                         "method": payment["payment_method"],
+                        "currency": payment["payment_currency"],
+                        "exchangeRate": payment["exchange_rate"],
                         "status": payment["status"],
                         "reference": payment["provider_reference"],
                         "paidAt": payment["paid_at"],
@@ -3073,6 +5658,49 @@ def find_sku(connection: sqlite3.Connection, product_id: str, variants: dict) ->
     raise ValueError("所选规格已失效，请重新选择")
 
 
+def enforce_checkout_risk_controls(
+    connection: sqlite3.Connection,
+    user_id: str,
+    grouped: dict[str, list[tuple[sqlite3.Row, sqlite3.Row, int, dict, str | None]]],
+) -> None:
+    """Block clear abuse while preserving a review trail for softer signals."""
+    pending_count = connection.execute(
+        "SELECT COUNT(*) FROM orders WHERE buyer_user_id = ? AND status = 'pending_payment' AND placed_at >= datetime('now', '-24 hours')",
+        (user_id,),
+    ).fetchone()[0]
+    if pending_count >= 5:
+        record_risk_case(connection, "order_anomaly", "high", "too_many_pending_orders", subject_user_id=user_id, detail={"pendingOrders24h": pending_count})
+        raise ValueError("待支付订单过多，请先完成或取消现有订单后再试")
+    recent_count = connection.execute(
+        "SELECT COUNT(*) FROM orders WHERE buyer_user_id = ? AND placed_at >= datetime('now', '-10 minutes')",
+        (user_id,),
+    ).fetchone()[0]
+    if recent_count >= 8:
+        record_risk_case(connection, "order_anomaly", "high", "rapid_order_creation", subject_user_id=user_id, detail={"orders10m": recent_count})
+        raise ValueError("下单操作过于频繁，请稍后再试")
+    for shop_id in grouped:
+        owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,)).fetchone()
+        if owner and owner[0] == user_id:
+            record_risk_case(connection, "wash_trading", "high", "self_dealing_attempt", subject_user_id=user_id, detail={"shopId": shop_id})
+            raise ValueError("不能购买自己店铺的商品")
+    history = connection.execute(
+        "SELECT COUNT(*) AS orders, SUM(CASE WHEN status IN ('refunding', 'refunded') THEN 1 ELSE 0 END) AS refunds FROM orders WHERE buyer_user_id = ? AND placed_at >= datetime('now', '-90 days')",
+        (user_id,),
+    ).fetchone()
+    if int(history["orders"] or 0) >= 4 and int(history["refunds"] or 0) * 2 >= int(history["orders"] or 0):
+        record_risk_case(connection, "refund_dispute", "medium", "high_refund_ratio", subject_user_id=user_id, detail={"orders90d": history["orders"], "refunds90d": history["refunds"]})
+
+
+def enforce_coupon_claim_risk_controls(connection: sqlite3.Connection, user_id: str) -> None:
+    claims = connection.execute(
+        "SELECT COUNT(*) FROM platform_campaign_claims WHERE buyer_user_id = ? AND updated_at >= datetime('now', '-10 minutes')",
+        (user_id,),
+    ).fetchone()[0]
+    if claims >= 5:
+        record_risk_case(connection, "coupon_abuse", "high", "rapid_coupon_claims", subject_user_id=user_id, detail={"claims10m": claims})
+        raise ValueError("领券操作过于频繁，请稍后再试")
+
+
 def create_orders(user_id: str, payload: dict) -> list[dict]:
     raw_items = payload.get("items") or []
     if not raw_items:
@@ -3087,6 +5715,7 @@ def create_orders(user_id: str, payload: dict) -> list[dict]:
         if not address:
             raise ValueError("请选择收货地址")
         grouped = checkout_groups(connection, raw_items)
+        enforce_checkout_risk_controls(connection, user_id, grouped)
         payment_method = str(payload.get("paymentMethod") or "alipay")
         channel = analytics_channel(payload.get("channel"))
         if payment_method not in ("alipay", "card"):
@@ -3097,17 +5726,25 @@ def create_orders(user_id: str, payload: dict) -> list[dict]:
             order_id = f"order-{secrets.token_urlsafe(12)}"
             order_no = f"SZ{datetime.now().strftime('%y%m%d%H%M%S')}{secrets.randbelow(900) + 100}"
             item_amount = sum(item[1]["price_cents"] * item[2] for item in items)
-            shipping_amount, discount_amount, campaign = shop_charge(
-                connection, shop_id, user_id, item_amount, sum(item[2] for item in items)
+            shipping_amount, discount_amount, campaign, shipping_rule = shop_charge(
+                connection, shop_id, user_id, item_amount, sum(item[2] for item in items), address["country_code"]
             )
             amount = item_amount + shipping_amount - discount_amount
             connection.execute(
                 """
-                INSERT INTO orders (id, order_no, buyer_user_id, shop_id, address_snapshot, item_amount_cents, shipping_amount_cents, discount_amount_cents, paid_amount_cents, attribution_channel, status, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_payment', datetime('now', '+30 minutes'))
+                INSERT INTO orders (id, order_no, buyer_user_id, shop_id, address_snapshot, shipping_rule_snapshot_json, item_amount_cents, shipping_amount_cents, discount_amount_cents, paid_amount_cents, pricing_currency, payment_currency, settlement_currency, payment_exchange_rate, settlement_exchange_rate, attribution_channel, status, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_payment', datetime('now', '+30 minutes'))
                 """,
-                (order_id, order_no, user_id, shop_id, json.dumps(address_for_response(address), ensure_ascii=False), item_amount, shipping_amount, discount_amount, amount, channel),
+                (order_id, order_no, user_id, shop_id, json.dumps(address_for_response(address), ensure_ascii=False), json.dumps(shipping_rule, ensure_ascii=False), item_amount, shipping_amount, discount_amount, amount, PLATFORM_CURRENCY, PLATFORM_CURRENCY, PLATFORM_CURRENCY, USD_EXCHANGE_RATE, USD_EXCHANGE_RATE, channel),
             )
+            recent_like_orders = connection.execute(
+                "SELECT COUNT(*) FROM orders WHERE buyer_user_id = ? AND shop_id = ? AND item_amount_cents = ? AND placed_at >= datetime('now', '-10 minutes')",
+                (user_id, shop_id, item_amount),
+            ).fetchone()[0]
+            if recent_like_orders >= 3:
+                record_risk_case(connection, "wash_trading", "high", "repeated_same_shop_order", subject_user_id=user_id, order_id=order_id, detail={"shopId": shop_id, "itemAmountCents": item_amount, "orders10m": recent_like_orders})
+            if campaign and item_amount and campaign["discount"] * 100 >= item_amount * 60:
+                record_risk_case(connection, "coupon_abuse", "medium", "high_discount_ratio", subject_user_id=user_id, order_id=order_id, detail={"campaignId": campaign["id"], "discountCents": campaign["discount"], "itemAmountCents": item_amount})
             if campaign:
                 if campaign.get("claimId"):
                     claimed = connection.execute(
@@ -3122,8 +5759,8 @@ def create_orders(user_id: str, payload: dict) -> list[dict]:
                 )
                 record_order_resource_event(connection, order_id, "campaign_coupon", campaign["id"], "reserved", amount_cents=campaign["discount"])
             connection.execute(
-                "INSERT INTO payment_transactions (id, order_id, payment_method, amount_cents, payment_token) VALUES (?, ?, ?, ?, ?)",
-                (f"payment-{secrets.token_urlsafe(10)}", order_id, payment_method, amount, f"pay-{secrets.token_urlsafe(18)}"),
+                "INSERT INTO payment_transactions (id, order_id, payment_method, amount_cents, payment_currency, exchange_rate, payment_token) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"payment-{secrets.token_urlsafe(10)}", order_id, payment_method, amount, PLATFORM_CURRENCY, USD_EXCHANGE_RATE, f"pay-{secrets.token_urlsafe(18)}"),
             )
             for product, sku, quantity, variants, activity_id in items:
                 order_item_id = f"item-{secrets.token_urlsafe(10)}"
@@ -3133,12 +5770,12 @@ def create_orders(user_id: str, payload: dict) -> list[dict]:
                 ).fetchone()
                 connection.execute(
                     """
-                    INSERT INTO order_items (id, order_id, product_id, sku_id, title_snapshot, image_url_snapshot, specifications_snapshot, unit_price_cents, quantity, subtotal_cents)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO order_items (id, order_id, product_id, sku_id, title_snapshot, image_url_snapshot, specifications_snapshot, unit_price_cents, price_currency, quantity, subtotal_cents)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_item_id, order_id, product["id"], sku["id"], product["title"],
-                        cover[0] if cover else None, json.dumps(variants, ensure_ascii=False), sku["price_cents"], quantity,
+                        cover[0] if cover else None, json.dumps(variants, ensure_ascii=False), sku["price_cents"], product["price_currency"], quantity,
                         sku["price_cents"] * quantity,
                     ),
                 )
@@ -3157,7 +5794,8 @@ def checkout_quote(user_id: str, payload: dict) -> dict:
     with database() as connection:
         connection.row_factory = sqlite3.Row
         address_id = str(payload.get("addressId") or "")
-        if not connection.execute("SELECT 1 FROM buyer_addresses WHERE id = ? AND buyer_user_id = ?", (address_id, user_id)).fetchone():
+        address = connection.execute("SELECT * FROM buyer_addresses WHERE id = ? AND buyer_user_id = ?", (address_id, user_id)).fetchone()
+        if not address:
             raise ValueError("请选择收货地址")
         groups = checkout_groups(connection, raw_items)
         record_analytics_event(connection, "checkout_started", user_id=user_id, channel=payload.get("channel"))
@@ -3167,7 +5805,7 @@ def checkout_quote(user_id: str, payload: dict) -> dict:
         item_total = shipping_total = discount_total = 0
         for shop_id, items in groups.items():
             amount = sum(item[1]["price_cents"] * item[2] for item in items)
-            shipping, discount, campaign = shop_charge(connection, shop_id, user_id, amount, sum(item[2] for item in items), provisional_usage)
+            shipping, discount, campaign, shipping_rule = shop_charge(connection, shop_id, user_id, amount, sum(item[2] for item in items), address["country_code"], provisional_usage)
             if campaign:
                 prior_usage, prior_amount = provisional_usage.get(campaign["id"], (0, 0))
                 provisional_usage[campaign["id"]] = (prior_usage + 1, prior_amount + campaign["discount"])
@@ -3182,11 +5820,11 @@ def checkout_quote(user_id: str, payload: dict) -> dict:
                 provisional_activity_usage[activity_product["id"]] = reserved + quantity
                 activity_items.append({"id": activity_product["activity_id"], "name": activity_product["activity_name"], "productId": product["id"], "quantity": quantity})
             shop_name = connection.execute("SELECT name FROM shops WHERE id = ?", (shop_id,)).fetchone()[0]
-            shops.append({"shopId": shop_id, "shop": shop_name, "itemAmount": amount / 100, "shippingAmount": shipping / 100, "discountAmount": discount / 100, "amount": (amount + shipping - discount) / 100, "platformCampaign": campaign["name"] if campaign else None, "activities": activity_items})
+            shops.append({"shopId": shop_id, "shop": shop_name, "itemAmount": amount / 100, "shippingAmount": shipping / 100, "discountAmount": discount / 100, "amount": (amount + shipping - discount) / 100, "currency": PLATFORM_CURRENCY, "platformCampaign": campaign["name"] if campaign else None, "activities": activity_items, "shippingRule": shipping_rule})
             item_total += amount
             shipping_total += shipping
             discount_total += discount
-        return {"shops": shops, "itemAmount": item_total / 100, "shippingAmount": shipping_total / 100, "discountAmount": discount_total / 100, "amount": (item_total + shipping_total - discount_total) / 100}
+        return {"shops": shops, "itemAmount": item_total / 100, "shippingAmount": shipping_total / 100, "discountAmount": discount_total / 100, "amount": (item_total + shipping_total - discount_total) / 100, "currency": PLATFORM_CURRENCY, "exchangeRate": USD_EXCHANGE_RATE}
 
 
 def sku_variants(connection: sqlite3.Connection, sku_id: str | None) -> dict:
@@ -3252,15 +5890,19 @@ def after_sales_for_response(connection: sqlite3.Connection, where: str, params:
     connection.row_factory = sqlite3.Row
     rows = connection.execute(
         f"""
-        SELECT after_sale_requests.*, orders.order_no, shops.location AS return_address
+        SELECT after_sale_requests.*, order_refunds.status AS refund_status, orders.order_no, shops.location AS return_address,
+               shops.settings_json AS shop_settings_json
         FROM after_sale_requests
         JOIN orders ON orders.id = after_sale_requests.order_id
         JOIN shops ON shops.id = orders.shop_id
+        LEFT JOIN order_refunds ON order_refunds.after_sale_id = after_sale_requests.id
         WHERE {where} ORDER BY after_sale_requests.created_at DESC
         """,
         params,
     ).fetchall()
     def status_label(row: sqlite3.Row) -> str:
+        if row["status"] == "completed" and row["refund_status"] == "recorded":
+            return "退款已记账"
         if row["status"] == "approved" and row["request_type"] == "return_refund":
             return "待收货" if row["returned_at"] else "待退货"
         return AFTER_SALE_STATUS_LABELS[row["status"]]
@@ -3281,6 +5923,20 @@ def after_sales_for_response(connection: sqlite3.Connection, where: str, params:
             events.append({"time": row["received_at"], "label": "卖家确认收货，退款已完成", "detail": row["seller_response"] or ""})
         return events
 
+    def return_details(row: sqlite3.Row) -> dict:
+        try:
+            settings = json.loads(row["shop_settings_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            settings = {}
+        policy = settings.get("returnPolicy") if isinstance(settings, dict) else {}
+        if not isinstance(policy, dict):
+            policy = {}
+        return {
+            "address": str(policy.get("address") or row["return_address"] or "").strip(),
+            "recipientName": str(policy.get("recipientName") or "").strip(),
+            "recipientPhone": str(policy.get("recipientPhone") or "").strip(),
+        }
+
     return [
         {
             "id": row["id"],
@@ -3289,9 +5945,14 @@ def after_sales_for_response(connection: sqlite3.Connection, where: str, params:
             "reason": row["reason"],
             "status": status_label(row),
             "amount": row["requested_amount_cents"] / 100,
+            "currency": row["refund_currency"],
+            "exchangeRate": row["refund_exchange_rate"],
+            "refundStatus": row["refund_status"],
             "sellerResponse": row["seller_response"],
             "evidence": [item[0] for item in connection.execute("SELECT image_url FROM after_sale_evidence WHERE after_sale_id = ? ORDER BY sort_order", (row["id"],))],
-            "returnAddress": row["return_address"],
+            "returnAddress": (details := return_details(row))["address"],
+            "returnRecipientName": details["recipientName"],
+            "returnRecipientPhone": details["recipientPhone"],
             "returnShipment": (
                 {"carrier": row["return_carrier"], "trackingNo": row["return_tracking_no"], "shippedAt": row["returned_at"]}
                 if row["returned_at"]
@@ -3376,8 +6037,10 @@ def migrate_legacy_accounts(payload: dict) -> dict:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def cors_origin(self) -> str:
-        origin = self.headers.get("Origin", "")
+    def cors_origin(self) -> str | None:
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if PRODUCTION_HTTPS:
+            return origin if origin in ALLOWED_BROWSER_ORIGINS else None
         if origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:"):
             return origin
         return "http://127.0.0.1:5174"
@@ -3386,6 +6049,9 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "")
         if not origin:
             return False
+        normalized_origin = origin.rstrip("/")
+        if PRODUCTION_HTTPS:
+            return normalized_origin in ALLOWED_BROWSER_ORIGINS
         parsed = urlparse(origin)
         if parsed.scheme not in {"http", "https"}:
             return False
@@ -3503,21 +6169,99 @@ class Handler(BaseHTTPRequestHandler):
             COMMUNITY_LIVE_HUB.remove(self.connection)
             self.close_connection = True
 
-    def send_json(self, status: int, payload: dict, cookie: str | None = None) -> None:
+    def send_json(
+        self,
+        status: int,
+        payload: dict,
+        cookie: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        if PRODUCTION_HTTPS:
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
-        self.send_header("Access-Control-Allow-Credentials", "true")
+        if origin := self.cors_origin():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Access-Control-Expose-Headers", "X-CSRF-Token")
         if cookie:
             self.send_header("Set-Cookie", cookie)
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def enforce_rate_limit(
+        self,
+        action: str,
+        user_id: str | None,
+        *,
+        per_ip: int,
+        per_user: int | None,
+        window_seconds: int,
+    ) -> bool:
+        """Limit a sensitive action by IP and, when signed in, by account."""
+        subjects = [(f"ip:{client_ip(self)}", per_ip)]
+        if user_id and per_user is not None:
+            subjects.insert(0, (f"user:{user_id}", per_user))
+        for subject, maximum in subjects:
+            allowed, retry_after = REQUEST_RATE_LIMITER.allow(
+                action, subject, maximum, window_seconds
+            )
+            if not allowed:
+                self.send_json(
+                    429,
+                    {"error": "操作过于频繁，请稍后再试", "retryAfter": retry_after},
+                    extra_headers={"Retry-After": str(retry_after)},
+                )
+                return False
+        return True
+
+    def request_body_length(self) -> int | None:
+        """Return a safe request-body length or send the matching API error."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_json(400, {"error": "Invalid Content-Length"})
+            return None
+        if length < 0:
+            self.send_json(400, {"error": "Invalid Content-Length"})
+            return None
+        if length > MAX_REQUEST_BODY_BYTES:
+            self.send_json(413, {"error": "请求内容过大"})
+            return None
+        return length
+
+    def browser_origin_is_allowed(self) -> bool:
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if not origin:
+            return False
+        if PRODUCTION_HTTPS:
+            return origin in ALLOWED_BROWSER_ORIGINS
+        parsed = urlparse(origin)
+        return parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost"}
+
+    def enforce_state_change_protection(self) -> bool:
+        """Require a trusted browser origin and CSRF token for cookie writes."""
+        path = urlparse(self.path).path
+        # Provider webhooks verify a signed raw payload instead of browser headers.
+        if path in {"/api/integrations/logistics/webhooks", "/api/integrations/customer-service/webhooks"}:
+            return True
+        if not self.browser_origin_is_allowed():
+            self.send_json(403, {"error": "Untrusted request origin"})
+            return False
+        if not valid_session_csrf_token(self):
+            self.send_json(403, {"error": "Invalid CSRF token"})
+            return False
+        return True
 
     def send_media(self, filename: str) -> None:
         safe_name = Path(filename).name
@@ -3540,12 +6284,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_quarantined_product_media(self, asset_id: str) -> None:
+        """Serve a verified temporary asset only to the seller who uploaded it."""
+        user_id = session_user(self)
+        if not user_id:
+            self.send_json(401, {"error": "Unauthorized"})
+            return
+        with database() as connection:
+            connection.row_factory = sqlite3.Row
+            asset = connection.execute(
+                "SELECT * FROM media_assets WHERE id = ? AND uploader_user_id = ? AND status = 'temporary' "
+                "AND verified_at IS NOT NULL AND moderation_status = 'approved'",
+                (asset_id, user_id),
+            ).fetchone()
+        if not asset:
+            self.send_json(404, {"error": "Temporary media not found"})
+            return
+        try:
+            body = quarantined_media_bytes(asset)
+        except ValueError:
+            self.send_json(404, {"error": "Temporary media not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", asset["mime_type"])
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Step-Up")
-        self.send_header("Access-Control-Allow-Credentials", "true")
+        if origin := self.cors_origin():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Step-Up, X-CSRF-Token")
+            self.send_header("Access-Control-Allow-Credentials", "true")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -3564,8 +6338,36 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with database() as connection:
                 self.send_json(200, {"posts": community_posts_payload(connection, category)})
+        elif self.path == "/api/admin/community/posts":
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            require_admin(user_id)
+            with database() as connection:
+                self.send_json(200, {"posts": admin_community_posts_payload(connection)})
+        elif urlparse(self.path).path.startswith("/api/seller/media/assets/") and urlparse(self.path).path.endswith("/preview"):
+            asset_id = urlparse(self.path).path.removeprefix("/api/seller/media/assets/").removesuffix("/preview").strip("/")
+            if not re.fullmatch(r"asset-[A-Za-z0-9_-]{8,120}", asset_id):
+                self.send_json(404, {"error": "Temporary media not found"})
+                return
+            self.send_quarantined_product_media(asset_id)
         elif self.path.startswith("/media/"):
             self.send_media(self.path.removeprefix("/media/"))
+        elif urlparse(self.path).path == "/api/brand-site":
+            values = parse_qs(urlparse(self.path).query)
+            requested_domain = str(values.get("domain", [self.headers.get("Host", "").split(":", 1)[0]])[0])[:255]
+            requested_shop = str(values.get("shop", [""])[0])[:160]
+            preview_requested = str(values.get("preview", [""])[0]).strip(" \t,，") == "1"
+            payload = public_brand_site(
+                requested_domain,
+                requested_shop,
+                session_user(self) if preview_requested else None,
+            )
+            if not payload:
+                self.send_json(404, {"error": "独立站不存在、尚未启用，或域名未绑定"})
+                return
+            self.send_json(200, payload)
         elif self.path == "/api/catalog/products":
             self.send_json(200, {"products": catalog()})
         elif self.path == "/api/activities":
@@ -3688,6 +6490,21 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = str(values.get("buyerUserId", [""])[0]) or None
                 payload = seller_messages_payload(connection, user_id, shop_id, buyer_id, str(values.get("q", [""])[0]).strip())
             self.send_json(200, payload)
+        elif urlparse(self.path).path == "/api/seller/message-automation":
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            values = parse_qs(urlparse(self.path).query)
+            shop_id = str(values.get("shopId", [""])[0]).strip()
+            with database() as connection:
+                shop_ids = seller_accessible_shop_ids(connection, user_id, "messages")
+                if not shop_id:
+                    shop_id = shop_ids[0] if shop_ids else ""
+                if not shop_id or shop_id not in shop_ids:
+                    self.send_json(403, {"error": "Seller message permission required"})
+                    return
+                self.send_json(200, {"shopId": shop_id, "settings": shop_message_settings(connection, shop_id)})
         elif urlparse(self.path).path == "/api/messages/buyer/updates":
             user_id = session_user(self)
             if not user_id:
@@ -3754,6 +6571,32 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(403, {"error": "Seller access required"})
                     return
                 self.send_json(200, {"tickets": support_tickets_for(connection, user_id, "seller")})
+        elif self.path == "/api/seller/platform-support/tickets":
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            with database() as connection:
+                if not is_seller(connection, user_id):
+                    self.send_json(403, {"error": "Seller access required"})
+                    return
+                self.send_json(200, {"tickets": support_tickets_for(connection, user_id, "platform_seller")})
+        elif self.path.startswith("/api/seller/platform-support/tickets/"):
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            ticket_id = self.path.removeprefix("/api/seller/platform-support/tickets/").rstrip("/")
+            with database() as connection:
+                connection.row_factory = sqlite3.Row
+                if not is_seller(connection, user_id):
+                    self.send_json(403, {"error": "Seller access required"})
+                    return
+                ticket = connection.execute("SELECT * FROM support_tickets WHERE id = ?", (ticket_id,)).fetchone()
+                if not ticket or not support_ticket_access(connection, ticket, user_id, "platform_seller"):
+                    self.send_json(404, {"error": "Ticket not found"})
+                    return
+                self.send_json(200, {"ticket": support_ticket_response(connection, ticket, True)})
         elif self.path.startswith("/api/seller/support/tickets/"):
             user_id = session_user(self)
             if not user_id:
@@ -3777,13 +6620,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not is_seller(connection, user_id):
                     self.send_json(403, {"error": "Seller access required"})
                     return
-                profile = connection.execute("SELECT verification_status, legal_name, identity_number, contact_phone, verification_expires_at, verification_expiry_notified_at FROM seller_profiles WHERE user_id = ?", (user_id,)).fetchone()
-                application = connection.execute("SELECT * FROM seller_verification_applications WHERE seller_user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,)).fetchone()
+                profile = connection.execute("SELECT verification_status, legal_name, identity_number, contact_phone, business_address, operating_categories_json, verification_expires_at, verification_expiry_notified_at FROM seller_profiles WHERE user_id = ?", (user_id,)).fetchone()
+                application = connection.execute("SELECT * FROM seller_verification_applications WHERE seller_user_id = ? AND NOT (status = 'rejected' AND rejection_code = 'seller_withdrew') ORDER BY created_at DESC LIMIT 1", (user_id,)).fetchone()
+                # Older registration builds created an empty pending application
+                # before the seller had uploaded any materials. It was not a real
+                # submission and must not lock the seller in an audit state.
+                if application and application["status"] == "pending":
+                    document_count = connection.execute("SELECT COUNT(*) FROM seller_verification_documents WHERE application_id = ?", (application["id"],)).fetchone()[0]
+                    evidence = json.loads(application["evidence_json"] or "[]")
+                    if not document_count and not evidence:
+                        connection.execute("UPDATE seller_verification_applications SET status = 'rejected', rejection_code = 'seller_withdrew', review_note = '系统已清理旧版注册生成的空认证申请', reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (application["id"],))
+                        connection.execute("UPDATE seller_profiles SET verification_status = 'pending' WHERE user_id = ?", (user_id,))
+                        profile = connection.execute("SELECT verification_status, legal_name, identity_number, contact_phone, business_address, operating_categories_json, verification_expires_at, verification_expiry_notified_at FROM seller_profiles WHERE user_id = ?", (user_id,)).fetchone()
+                        application = None
                 expired = bool(profile and profile["verification_status"] == "approved" and profile["verification_expires_at"] and profile["verification_expires_at"] <= datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
                 if expired and not profile["verification_expiry_notified_at"]:
                     connection.execute("UPDATE seller_profiles SET verification_expiry_notified_at = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
                     notify_governance(connection, user_id, "seller_verification_expired", "卖家认证已到期", "请提交新的认证资料后继续经营", "seller_verification", application["id"] if application else user_id)
-                verification = {"status": "expired" if expired else (profile["verification_status"] if profile else "pending"), "legalName": profile["legal_name"] if profile else "", "identityNumber": profile["identity_number"] if profile else "", "contactPhone": profile["contact_phone"] if profile else "", "expiresAt": profile["verification_expires_at"] if profile else None, "application": None if not application else verification_application_response(connection, application)}
+                verification = {"status": "expired" if expired else (profile["verification_status"] if profile else "pending"), "legalName": profile["legal_name"] if profile else "", "identityNumber": profile["identity_number"] if profile else "", "contactPhone": profile["contact_phone"] if profile else "", "businessAddress": profile["business_address"] if profile else "", "operatingCategories": json.loads(profile["operating_categories_json"] or "[]") if profile else [], "expiresAt": profile["verification_expires_at"] if profile else None, "application": None if not application else verification_application_response(connection, application)}
             self.send_json(200, {"verification": verification})
         elif self.path == "/api/seller/staff/audit":
             user_id = session_user(self)
@@ -4030,8 +6884,8 @@ class Handler(BaseHTTPRequestHandler):
                     SELECT products.id, products.title, products.status, products.moderation_status,
                            products.moderation_reason, products.moderated_at, shops.name AS shop_name
                     FROM products JOIN shops ON shops.id = products.shop_id
-                    ORDER BY CASE products.moderation_status WHEN 'pending' THEN 0 WHEN 'rejected' THEN 1 ELSE 2 END,
-                             products.updated_at DESC
+                    WHERE products.status = 'published'
+                    ORDER BY products.updated_at DESC
                     """
                 ).fetchall()
             self.send_json(200, {"products": [
@@ -4076,6 +6930,17 @@ class Handler(BaseHTTPRequestHandler):
                     rows = connection.execute("SELECT platform_audit_logs.*, users.display_name AS actor FROM platform_audit_logs JOIN users ON users.id = platform_audit_logs.actor_user_id ORDER BY created_at DESC LIMIT 100").fetchall()
                     payload = {"logs": [{"id": row["id"], "actor": row["actor"], "action": row["action"], "targetType": row["target_type"], "targetId": row["target_id"], "detail": json.loads(row["detail_json"]), "createdAt": row["created_at"]} for row in rows]}
             self.send_json(200, payload)
+        elif self.path == "/api/admin/risk-cases":
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            with database() as connection:
+                if not is_admin(connection, user_id):
+                    self.send_json(403, {"error": "Administrator access required"})
+                    return
+                cases = risk_cases_payload(connection)
+            self.send_json(200, {"riskCases": cases})
         elif self.path == "/api/admin/media/assets":
             user_id = session_user(self)
             if not user_id:
@@ -4095,7 +6960,7 @@ class Handler(BaseHTTPRequestHandler):
             with database() as connection:
                 connection.row_factory = sqlite3.Row
                 rows = connection.execute(
-                    "SELECT id, title, content, audience, published_at FROM platform_announcements WHERE status = 'published' ORDER BY published_at DESC LIMIT 10"
+                    "SELECT id, title, content, image_url, audience, published_at FROM platform_announcements WHERE status = 'published' ORDER BY published_at DESC LIMIT 10"
                 ).fetchall()
                 roles = {row[0] for row in connection.execute("SELECT role FROM user_roles WHERE user_id = ?", (user_id,))} if user_id else set()
             audiences = {"all"}
@@ -4103,7 +6968,7 @@ class Handler(BaseHTTPRequestHandler):
                 audiences.add("buyer")
             if "seller" in roles:
                 audiences.add("seller")
-            self.send_json(200, {"announcements": [{"id": row["id"], "title": row["title"], "content": row["content"], "audience": row["audience"], "publishedAt": row["published_at"]} for row in rows if row["audience"] in audiences]})
+            self.send_json(200, {"announcements": [{"id": row["id"], "title": row["title"], "content": row["content"], "imageUrl": row["image_url"], "audience": row["audience"], "publishedAt": row["published_at"]} for row in rows if row["audience"] in audiences]})
         elif self.path.startswith("/api/admin/campaigns/") and self.path.endswith("/coupon-operations"):
             user_id = session_user(self)
             if not user_id:
@@ -4193,7 +7058,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 announcements = connection.execute("SELECT * FROM platform_announcements ORDER BY created_at DESC LIMIT 50").fetchall()
                 campaigns = campaign_performance(connection)[:50]
-            self.send_json(200, {"announcements": [{"id": row["id"], "title": row["title"], "content": row["content"], "audience": row["audience"], "status": row["status"], "publishedAt": row["published_at"]} for row in announcements], "campaigns": campaigns})
+            self.send_json(200, {"announcements": [{"id": row["id"], "title": row["title"], "content": row["content"], "imageUrl": row["image_url"], "audience": row["audience"], "status": row["status"], "publishedAt": row["published_at"]} for row in announcements], "campaigns": campaigns})
         elif self.path == "/api/admin/finance":
             user_id = session_user(self)
             if not user_id:
@@ -4271,7 +7136,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"profile": profile})
         elif self.path == "/api/auth/session":
             account = account_for_user(session_user(self) or "")
-            self.send_json(200, {"account": account})
+            csrf_token = rotate_session_csrf_token(self) if account else None
+            self.send_json(200, {"account": account}, extra_headers={"X-CSRF-Token": csrf_token} if csrf_token else None)
+        elif self.path == "/api/auth/csrf":
+            csrf_token = rotate_session_csrf_token(self)
+            self.send_json(200, {"csrf": bool(csrf_token)}, extra_headers={"X-CSRF-Token": csrf_token} if csrf_token else None)
         elif urlparse(self.path).path == "/api/analytics/admin/export":
             user_id = session_user(self)
             if not user_id:
@@ -4304,6 +7173,22 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/analytics/shops/"):
             shop_id = self.path.rsplit("/", 1)[-1]
             self.send_json(200, {"visitors": shop_visitors(shop_id)})
+        elif urlparse(self.path).path == "/api/analytics/seller/business":
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            with database() as connection:
+                if not is_seller(connection, user_id):
+                    self.send_json(403, {"error": "Seller access required"})
+                    return
+            try:
+                days = int(parse_qs(urlparse(self.path).query).get("days", ["30"])[0])
+                business = seller_business_analytics(user_id, days)
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+                return
+            self.send_json(200, business)
         elif urlparse(self.path).path == "/api/analytics/seller":
             user_id = session_user(self)
             if not user_id:
@@ -4313,8 +7198,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not is_seller(connection, user_id):
                     self.send_json(403, {"error": "Seller access required"})
                     return
-            days = int(parse_qs(urlparse(self.path).query).get("days", ["30"])[0])
-            self.send_json(200, {"analytics": seller_analytics(user_id, days)})
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                days = int(query.get("days", ["30"])[0])
+                analytics = seller_analytics(user_id, days, query.get("start", [None])[0], query.get("end", [None])[0])
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+                return
+            self.send_json(200, {"analytics": analytics})
         elif self.path.startswith("/api/states/"):
             user_id = self.path.rsplit("/", 1)[-1]
             if session_user(self) != user_id:
@@ -4327,10 +7218,171 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
+        if not self.enforce_state_change_protection():
+            return
         try:
+            # Reject unauthenticated or over-quota upload attempts before
+            # reading a base64 payload into memory. COS direct uploads are
+            # limited here as well because their signed tickets authorize
+            # billable storage operations.
+            if self.path in {"/api/seller/media/direct-upload", "/api/seller/media/complete", "/api/seller/media/upload"}:
+                upload_user_id = session_user(self)
+                if not upload_user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                require_seller(upload_user_id)
+                if not self.enforce_rate_limit(
+                    "product-media-upload", upload_user_id, per_ip=80, per_user=40, window_seconds=600
+                ):
+                    return
+            elif self.path == "/api/media":
+                upload_user_id = session_user(self)
+                if not upload_user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                if not self.enforce_rate_limit(
+                    "media-upload", upload_user_id, per_ip=60, per_user=30, window_seconds=600
+                ):
+                    return
             length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            if self.path == "/api/community/media":
+            if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+                self.send_json(413, {"error": "请求内容过大"})
+                return
+            raw_body = self.rfile.read(length)
+            payload = json.loads(raw_body.decode("utf-8"))
+            if self.path == "/api/seller/message-automation/settings":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                shop_id = str(payload.get("shopId") or "").strip()
+                with database() as connection:
+                    require_shop_permission(connection, user_id, shop_id, "messages")
+                    timezone_name = str(payload.get("timezone") or "Asia/Shanghai").strip()
+                    try:
+                        ZoneInfo(timezone_name)
+                    except ZoneInfoNotFoundError:
+                        raise ValueError("时区无效")
+                    weekly = normalise_message_weekly_hours(payload.get("weeklyHours"))
+                    template = str(payload.get("offHoursReplyTemplate") or "").strip()[:500]
+                    if not template:
+                        raise ValueError("非工作时间自动回复不能为空")
+                    minutes = max(1, min(60, int(payload.get("unansweredMinutes") or 3)))
+                    connection.execute(
+                        """INSERT INTO seller_message_settings
+                           (shop_id, timezone, weekly_hours_json, unanswered_minutes, off_hours_auto_reply_enabled,
+                            off_hours_reply_template, urgent_email_enabled, urgent_sms_enabled,
+                            unanswered_email_enabled, ai_reply_enabled)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(shop_id) DO UPDATE SET timezone = excluded.timezone,
+                           weekly_hours_json = excluded.weekly_hours_json, unanswered_minutes = excluded.unanswered_minutes,
+                           off_hours_auto_reply_enabled = excluded.off_hours_auto_reply_enabled,
+                           off_hours_reply_template = excluded.off_hours_reply_template,
+                           urgent_email_enabled = excluded.urgent_email_enabled, urgent_sms_enabled = excluded.urgent_sms_enabled,
+                           unanswered_email_enabled = excluded.unanswered_email_enabled, ai_reply_enabled = excluded.ai_reply_enabled,
+                           updated_at = CURRENT_TIMESTAMP""",
+                        (shop_id, timezone_name, json.dumps(weekly, ensure_ascii=False), minutes,
+                         int(bool(payload.get("offHoursAutoReplyEnabled", True))), template,
+                         int(bool(payload.get("urgentEmailEnabled", True))), int(bool(payload.get("urgentSmsEnabled", False))),
+                         int(bool(payload.get("unansweredEmailEnabled", True))), int(bool(payload.get("aiReplyEnabled", True)))),
+                    )
+                    self.send_json(200, {"settings": shop_message_settings(connection, shop_id)})
+                return
+            if self.path == "/api/seller/message-automation/ai-draft":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                shop_id, buyer_id = str(payload.get("shopId") or "").strip(), str(payload.get("buyerUserId") or "").strip()
+                with database() as connection:
+                    draft = seller_ai_message_draft(connection, user_id, shop_id, buyer_id)
+                self.send_json(200, {"draft": draft})
+                return
+            if self.path == "/api/seller/ai-assistant/chat":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                with database() as connection:
+                    if not is_seller(connection, user_id):
+                        self.send_json(403, {"error": "Seller access required"})
+                        return
+                if not isinstance(payload, dict):
+                    raise ValueError("对话内容无效")
+                reply = seller_ai_assistant_reply(
+                    user_id,
+                    payload.get("message"),
+                    payload.get("history"),
+                )
+                self.send_json(200, {"reply": reply})
+                return
+            if self.path == "/api/generate-title":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                with database() as connection:
+                    if not is_seller(connection, user_id):
+                        self.send_json(403, {"error": "Seller access required"})
+                        return
+                if not isinstance(payload, dict):
+                    raise ValueError("标题生成请求无效")
+                generated = seller_ai_product_title(user_id, payload.get("imageData"))
+                self.send_json(200, {
+                    "title": generated["englishTitle"],
+                    "titleZh": generated["chineseTitle"],
+                })
+                return
+            if self.path.startswith("/api/admin/risk-cases/") and self.path.endswith("/resolve"):
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                require_admin_step_up(self, user_id)
+                case_id = self.path.removeprefix("/api/admin/risk-cases/").removesuffix("/resolve").rstrip("/")
+                status = str(payload.get("status") or "resolved")
+                note = str(payload.get("note") or "").strip()[:1000]
+                if status not in ("resolved", "dismissed", "reviewing"):
+                    raise ValueError("Invalid risk case status")
+                with database() as connection:
+                    if not is_admin(connection, user_id):
+                        self.send_json(403, {"error": "Administrator access required"})
+                        return
+                    updated = connection.execute(
+                        "UPDATE risk_cases SET status = ?, resolved_at = CASE WHEN ? IN ('resolved', 'dismissed') THEN CURRENT_TIMESTAMP ELSE NULL END, resolved_by_user_id = CASE WHEN ? IN ('resolved', 'dismissed') THEN ? ELSE NULL END, resolution_note = ? WHERE id = ?",
+                        (status, status, status, user_id, note or None, case_id),
+                    ).rowcount
+                    if not updated:
+                        raise ValueError("Risk case not found")
+                    write_platform_audit(connection, user_id, "risk_case_updated", "risk_case", case_id, {"status": status, "note": note})
+                    cases = risk_cases_payload(connection)
+                self.send_json(200, {"riskCases": cases})
+                return
+            if self.path == "/api/brand-site/subscribers":
+                if not isinstance(payload, dict):
+                    raise ValueError("订阅内容无效")
+                shop_id = str(payload.get("shopId") or "").strip()[:160]
+                email = str(payload.get("email") or "").strip().lower()[:254]
+                if not shop_id or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+                    raise ValueError("请输入正确的邮箱地址")
+                with database() as connection:
+                    row = connection.execute("SELECT settings_json FROM shops WHERE id = ? AND status = 'active'", (shop_id,)).fetchone()
+                    if not row:
+                        self.send_json(404, {"error": "独立站不存在或尚未启用"})
+                        return
+                    try:
+                        settings = json.loads(row[0] or "{}")
+                    except json.JSONDecodeError:
+                        settings = {}
+                    if not isinstance(settings, dict) or not isinstance(settings.get("brandSite"), dict) or settings["brandSite"].get("status") != "published":
+                        self.send_json(404, {"error": "独立站尚未启用"})
+                        return
+                    connection.execute(
+                        "INSERT INTO brand_site_subscribers (id, shop_id, email) VALUES (?, ?, ?) ON CONFLICT(shop_id, email) DO UPDATE SET status = 'subscribed', updated_at = CURRENT_TIMESTAMP",
+                        (f"brand-sub-{secrets.token_urlsafe(10)}", shop_id, email),
+                    )
+                self.send_json(201, {"ok": True})
+            elif self.path == "/api/community/media":
                 if not isinstance(payload, dict):
                     raise ValueError("图片内容无效")
                 visitor_id = str(payload.get("visitorId") or "").strip()
@@ -4347,13 +7399,18 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/community/posts":
                 if not isinstance(payload, dict):
                     raise ValueError("发帖内容无效")
-                visitor_id, nickname = community_identity(payload)
+                visitor_id, nickname = community_identity(self, payload)
                 category = str(payload.get("category") or "").strip()
                 title = re.sub(r"\s+", " ", str(payload.get("title") or "").strip())
                 content = str(payload.get("content") or "").strip()
+                image_url = str(payload.get("imageUrl") or "").strip() or None
+                if image_url and not image_url.startswith(("/media/", "http://", "https://")):
+                    raise ValueError("图片地址无效")
                 attachment_urls = community_attachment_urls(payload)
                 if category not in COMMUNITY_CATEGORIES:
                     raise ValueError("请选择社区分类")
+                if category == "平台公告":
+                    raise ValueError("平台公告仅可由管理员发布")
                 if not 2 <= len(title) <= 80:
                     raise ValueError("标题请填写 2 到 80 个字符")
                 if not 2 <= len(content) <= 2000:
@@ -4376,13 +7433,13 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/community/posts/") and self.path.endswith("/comments"):
                 if not isinstance(payload, dict):
                     raise ValueError("评论内容无效")
-                visitor_id, nickname = community_identity(payload)
+                visitor_id, nickname = community_identity(self, payload)
                 post_id = self.path.removeprefix("/api/community/posts/").removesuffix("/comments").rstrip("/")
                 parent_comment_id = str(payload.get("parentCommentId") or "").strip() or None
                 content = str(payload.get("content") or "").strip()
                 attachment_urls = community_attachment_urls(payload)
-                if not post_id or not 2 <= len(content) <= 500:
-                    raise ValueError("评论请填写 2 到 500 个字符")
+                if not post_id or not 1 <= len(content) <= 500:
+                    raise ValueError("评论请填写 1 到 500 个字符")
                 if next((word for word in SENSITIVE_CONTENT_WORDS if word in content), None):
                     raise ValueError("内容未通过基础审核，请调整后再发布")
                 if not community_rate_allowed(self, visitor_id, "comment", 12, 600):
@@ -4404,10 +7461,33 @@ class Handler(BaseHTTPRequestHandler):
                     comment = connection.execute("SELECT id, nickname, content, created_at, parent_comment_id, attachment_url FROM community_comments WHERE id = ?", (comment_id,)).fetchone()
                 COMMUNITY_LIVE_HUB.publish({"type": "community_comment_created", "postId": post_id, "commentId": comment_id})
                 self.send_json(201, {"comment": {"id": comment[0], "nickname": comment[1], "content": comment[2], "createdAt": comment[3], "parentCommentId": comment[4], "imageUrl": comment[5], "imageUrls": attachment_urls}})
+            elif self.path.startswith("/api/admin/community/posts/") and self.path.endswith("/pin"):
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                require_admin(user_id)
+                post_id = self.path.removeprefix("/api/admin/community/posts/").removesuffix("/pin").rstrip("/")
+                pinned = payload.get("pinned") is True
+                with database() as connection:
+                    updated = connection.execute(
+                        """
+                        UPDATE community_posts
+                        SET is_pinned = ?, pinned_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
+                            pinned_by_user_id = CASE WHEN ? THEN ? ELSE NULL END, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status = 'published'
+                        """,
+                        (int(pinned), int(pinned), int(pinned), user_id, post_id),
+                    ).rowcount
+                    if not updated:
+                        raise ValueError("帖子不存在或已隐藏")
+                    write_platform_audit(connection, user_id, "community_post_pinned" if pinned else "community_post_unpinned", "community_post", post_id)
+                COMMUNITY_LIVE_HUB.publish({"type": "community_post_updated", "postId": post_id})
+                self.send_json(200, {"ok": True, "pinned": pinned})
             elif self.path == "/api/community/reports":
                 if not isinstance(payload, dict):
                     raise ValueError("举报内容无效")
-                visitor_id, _ = community_identity(payload)
+                visitor_id, _ = community_identity(self, payload)
                 target_type = str(payload.get("targetType") or "")
                 target_id = str(payload.get("targetId") or "").strip()
                 reason = str(payload.get("reason") or "").strip()
@@ -4426,6 +7506,18 @@ class Handler(BaseHTTPRequestHandler):
                     report_id = f"community-report-{secrets.token_urlsafe(10)}"
                     connection.execute("INSERT INTO community_reports (id, visitor_id, target_type, target_id, reason) VALUES (?, ?, ?, ?, ?)", (report_id, visitor_id, target_type, target_id, reason))
                 self.send_json(201, {"report": {"id": report_id, "status": "pending"}})
+            elif self.path == "/api/integrations/logistics/webhooks":
+                if not LOGISTICS_WEBHOOK_SECRET:
+                    self.send_json(503, {"error": "Logistics webhook is not configured"})
+                    return
+                if not logistics_webhook_is_valid(raw_body, self.headers.get("X-Logistics-Signature", "")):
+                    self.send_json(403, {"error": "Invalid logistics webhook signature"})
+                    return
+                if not isinstance(payload, dict):
+                    raise ValueError("物流回调内容无效")
+                with database() as connection:
+                    result = record_logistics_webhook_event(connection, payload)
+                self.send_json(202, result)
             elif self.path == "/api/integrations/customer-service/webhooks":
                 if not CUSTOMER_SERVICE_WEBHOOK_SECRET:
                     self.send_json(503, {"error": "Customer service webhook is not configured"})
@@ -4471,6 +7563,7 @@ class Handler(BaseHTTPRequestHandler):
                 code = re.sub(r"\s+", "", str(payload.get("code") or "").upper())
                 with database() as connection:
                     connection.row_factory = sqlite3.Row
+                    enforce_coupon_claim_risk_controls(connection, user_id)
                     coupon = connection.execute("SELECT * FROM campaign_coupon_codes WHERE code = ? AND status = 'issued' AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)", (code,)).fetchone()
                     if not coupon or (coupon["assigned_user_id"] and coupon["assigned_user_id"] != user_id): raise ValueError("券码无效或已失效")
                     connection.execute("INSERT INTO platform_campaign_claims (id, campaign_id, buyer_user_id) VALUES (?, ?, ?) ON CONFLICT(campaign_id, buyer_user_id) DO UPDATE SET claimed_quantity = claimed_quantity + 1, updated_at = CURRENT_TIMESTAMP", (f"campaign-claim-{secrets.token_urlsafe(10)}", coupon["campaign_id"], user_id))
@@ -4485,6 +7578,7 @@ class Handler(BaseHTTPRequestHandler):
                 campaign_id = self.path.removeprefix("/api/campaigns/").removesuffix("/claim").rstrip("/")
                 with database() as connection:
                     connection.row_factory = sqlite3.Row
+                    enforce_coupon_claim_risk_controls(connection, user_id)
                     campaign = connection.execute("SELECT * FROM platform_campaigns WHERE id = ? AND campaign_type = 'coupon' AND status = 'active' AND (starts_at IS NULL OR starts_at <= CURRENT_TIMESTAMP) AND (ends_at IS NULL OR ends_at > CURRENT_TIMESTAMP)", (campaign_id,)).fetchone()
                     if not campaign:
                         raise ValueError("Coupon is unavailable")
@@ -4497,16 +7591,47 @@ class Handler(BaseHTTPRequestHandler):
                         connection.execute("INSERT INTO platform_campaign_claims (id, campaign_id, buyer_user_id) VALUES (?, ?, ?)", (f"campaign-claim-{secrets.token_urlsafe(10)}", campaign_id, user_id))
                     self.send_json(201, {"coupons": buyer_coupons(connection, user_id)})
             elif self.path == "/api/analytics/events":
-                event_type = str(payload.get("type") or "")
-                product_id = str(payload.get("productId") or "") or None
-                if event_type != "product_view" or not product_id:
-                    raise ValueError("Invalid analytics event")
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid analytics event batch")
+                events = payload.get("events") if "events" in payload else [payload]
                 with database() as connection:
-                    product = connection.execute("SELECT shop_id FROM products WHERE id = ? AND status = 'published'", (product_id,)).fetchone()
-                    if not product:
-                        raise ValueError("Product not found")
-                    record_analytics_event(connection, "product_view", visitor_key=str(payload.get("visitorKey") or "")[:100], user_id=session_user(self), shop_id=product[0], product_id=product_id, channel=payload.get("channel"))
-                self.send_json(201, {"ok": True})
+                    accepted, duplicates = record_public_analytics_events(connection, events, session_user(self))
+                self.send_json(201, {"ok": True, "accepted": accepted, "duplicates": duplicates})
+            elif self.path == "/api/seller/media/direct-upload":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                require_seller(user_id)
+                mime_type = str(payload.get("mimeType") or "").strip().lower()
+                try:
+                    byte_size = int(payload.get("size") or 0)
+                except (TypeError, ValueError):
+                    byte_size = 0
+                content_hash = str(payload.get("contentHash") or "").strip().lower() or None
+                media_type = str(payload.get("mediaType") or "image").strip().lower()
+                self.send_json(201, create_public_cos_upload_ticket(user_id, mime_type, byte_size, content_hash, media_type))
+            elif self.path == "/api/seller/media/complete":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                require_seller(user_id)
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid media completion request")
+                asset_id = str(payload.get("assetId") or "").strip()
+                if not re.fullmatch(r"asset-[A-Za-z0-9_-]{8,120}", asset_id):
+                    raise ValueError("Invalid media asset")
+                self.send_json(200, complete_product_media_upload(user_id, asset_id))
+            elif self.path == "/api/seller/media/upload":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                require_seller(user_id)
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid media upload")
+                self.send_json(201, create_quarantined_product_media(user_id, str(payload.get("mediaType") or ""), payload.get("data")))
             elif self.path == "/api/media":
                 user_id = session_user(self)
                 if not user_id:
@@ -4516,16 +7641,22 @@ class Handler(BaseHTTPRequestHandler):
                 if media_type not in ("image", "video"):
                     raise ValueError("媒体类型无效")
                 mime_type, binary = decode_media_data_url(payload.get("data"), media_type)
-                MEDIA_DIR.mkdir(parents=True, exist_ok=True)
                 filename = f"{media_type}-{secrets.token_urlsafe(16)}{(IMAGE_MIME_TYPES if media_type == 'image' else VIDEO_MIME_TYPES)[mime_type]}"
-                (MEDIA_DIR / filename).write_bytes(binary)
+                public_upload = payload.get("visibility") == "public"
+                uploaded = upload_public_media_to_cos(filename, mime_type, binary) if public_upload else None
+                if uploaded:
+                    storage_key, public_url = uploaded
+                else:
+                    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+                    (MEDIA_DIR / filename).write_bytes(binary)
+                    storage_key, public_url = filename, f"/media/{filename}"
                 asset_id = f"asset-{secrets.token_urlsafe(12)}"
                 with database() as connection:
                     connection.execute(
-                        "INSERT INTO media_assets (id, uploader_user_id, media_type, mime_type, storage_key, public_url, byte_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (asset_id, user_id, media_type, mime_type, filename, f"/media/{filename}", len(binary)),
+                        "INSERT INTO media_assets (id, uploader_user_id, media_type, mime_type, storage_key, public_url, byte_size, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (asset_id, user_id, media_type, mime_type, storage_key, public_url, len(binary), hashlib.sha256(binary).hexdigest()),
                     )
-                self.send_json(201, {"id": asset_id, "url": f"/media/{filename}", "mediaType": media_type, "size": len(binary)})
+                self.send_json(201, {"id": asset_id, "url": public_url, "mediaType": media_type, "size": len(binary)})
             elif self.path == "/api/reports":
                 user_id = session_user(self)
                 if not user_id:
@@ -4593,24 +7724,44 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
                 announcement_id = str(payload.get("id") or f"announcement-{secrets.token_urlsafe(10)}")
                 title, content = str(payload.get("title") or "").strip(), str(payload.get("content") or "").strip()
                 audience, status = str(payload.get("audience") or "all"), str(payload.get("status") or "draft")
+                image_url = str(payload.get("imageUrl") or "").strip()
+                if image_url and not image_url.startswith(("/media/", "http://", "https://")):
+                    raise ValueError("公告图片地址无效")
                 if not title or not content or len(title) > 80 or len(content) > 500 or audience not in ("all", "buyer", "seller") or status not in ("draft", "published", "archived"):
                     raise ValueError("公告内容或状态无效")
                 with database() as connection:
                     connection.execute(
                         """
-                        INSERT INTO platform_announcements (id, title, content, audience, status, published_at, created_by_user_id)
-                        VALUES (?, ?, ?, ?, ?, CASE WHEN ? = 'published' THEN CURRENT_TIMESTAMP END, ?)
-                        ON CONFLICT(id) DO UPDATE SET title = excluded.title, content = excluded.content, audience = excluded.audience,
+                        INSERT INTO platform_announcements (id, title, content, image_url, audience, status, published_at, created_by_user_id)
+                        VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? = 'published' THEN CURRENT_TIMESTAMP END, ?)
+                        ON CONFLICT(id) DO UPDATE SET title = excluded.title, content = excluded.content, image_url = excluded.image_url, audience = excluded.audience,
                           status = excluded.status, published_at = CASE WHEN excluded.status = 'published' THEN COALESCE(platform_announcements.published_at, CURRENT_TIMESTAMP) ELSE platform_announcements.published_at END,
                           updated_at = CURRENT_TIMESTAMP
                         """,
-                        (announcement_id, title, content, audience, status, status, user_id),
+                        (announcement_id, title, content, image_url or None, audience, status, status, user_id),
                     )
-                    write_platform_audit(connection, user_id, f"announcement_{status}", "announcement", announcement_id, {"audience": audience})
+                    community_post_id = f"community-announcement-{announcement_id}"
+                    if status == "published":
+                        connection.execute(
+                            """
+                            INSERT INTO community_posts (id, visitor_id, nickname, category, title, content, attachment_url, status)
+                            VALUES (?, ?, '平台管理员', '平台公告', ?, ?, ?, 'published')
+                            ON CONFLICT(id) DO UPDATE SET nickname = excluded.nickname, title = excluded.title, content = excluded.content, attachment_url = excluded.attachment_url,
+                              status = 'published', updated_at = CURRENT_TIMESTAMP
+                            """,
+                            (community_post_id, f"platform-{user_id}", title, content, image_url or None),
+                        )
+                        connection.execute("DELETE FROM community_post_images WHERE post_id = ?", (community_post_id,))
+                    else:
+                        connection.execute(
+                            "UPDATE community_posts SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (community_post_id,),
+                        )
+                    write_platform_audit(connection, user_id, f"announcement_{status}", "announcement", announcement_id, {"audience": audience, "communityPostId": community_post_id})
+                COMMUNITY_LIVE_HUB.publish({"type": "community_post_updated", "postId": community_post_id})
                 self.send_json(200, {"ok": True, "id": announcement_id})
             elif self.path.startswith("/api/admin/campaigns/") and self.path.endswith("/end"):
                 user_id = session_user(self)
@@ -4865,7 +8016,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
                 fee_bps = int(number(payload.get("serviceFeeBps")))
                 if not 0 <= fee_bps <= 3000:
                     raise ValueError("平台服务费率必须为 0-30%")
@@ -4879,7 +8030,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
                 withdrawal_id = self.path.removeprefix("/api/admin/withdrawals/").rstrip("/")
                 decision = str(payload.get("decision") or "")
                 note = str(payload.get("note") or "").strip()[:500]
@@ -5086,6 +8237,8 @@ class Handler(BaseHTTPRequestHandler):
                     message = "认证已通过" if decision == "approved" else ("请在截止日前补充认证材料" if decision == "supplement_required" else note)
                     notify_governance(connection, application["seller_user_id"], "seller_verification", "卖家认证结果", message, "seller_verification", application_id)
                     write_platform_audit(connection, user_id, f"seller_verification_{decision}", "seller_verification", application_id, {"sellerUserId": application["seller_user_id"], "expiresAt": expiry, "documentReviewCount": len(document_reviews)})
+                if decision in ("rejected", "supplement_required"):
+                    enqueue_tencent_sms_notification(application["contact_phone"], "seller_rejected")
                 self.send_json(200, {"ok": True})
             elif self.path == "/api/admin/service-automation":
                 user_id = session_user(self)
@@ -5174,10 +8327,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
                 product_ids = list(dict.fromkeys(str(item) for item in payload.get("productIds") or [] if str(item)))[:100]
                 decision, reason = str(payload.get("decision") or ""), str(payload.get("reason") or "").strip()
-                if not product_ids or decision not in ("approved", "rejected") or (decision == "rejected" and not reason):
+                if not product_ids or decision != "rejected" or not reason:
                     raise ValueError("批量审核参数无效")
                 with database() as connection:
                     placeholders = ",".join("?" for _ in product_ids)
@@ -5185,10 +8338,10 @@ class Handler(BaseHTTPRequestHandler):
                     if len(found) != len(product_ids):
                         raise ValueError("包含不存在的作品")
                     for product_id in product_ids:
-                        connection.execute("UPDATE products SET moderation_status = ?, moderation_reason = ?, moderated_at = CURRENT_TIMESTAMP, status = CASE WHEN ? = 'rejected' THEN 'unlisted' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (decision, reason or None, decision, product_id))
-                        write_moderation_log(connection, product_id, f"bulk:{decision}:{reason}", decision, reason or None)
+                        connection.execute("UPDATE products SET moderation_status = 'rejected', moderation_reason = ?, moderated_at = CURRENT_TIMESTAMP, status = 'unlisted', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'published'", (reason, product_id))
+                        write_moderation_log(connection, product_id, f"bulk:rejected:{reason}", "rejected", reason)
                         complete_governance_task(connection, "product_moderation", product_id, user_id)
-                    write_platform_audit(connection, user_id, f"products_bulk_{decision}", "product", ",".join(product_ids), {"count": len(product_ids), "reason": reason})
+                    write_platform_audit(connection, user_id, "products_bulk_unlisted", "product", ",".join(product_ids), {"count": len(product_ids), "reason": reason})
                 self.send_json(200, {"ok": True, "count": len(product_ids)})
             elif self.path.startswith("/api/admin/enforcement/templates/") and self.path.endswith("/apply"):
                 user_id = session_user(self)
@@ -5196,7 +8349,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
                 template_id = self.path.removeprefix("/api/admin/enforcement/templates/").removesuffix("/apply").rstrip("/")
                 target_id = str(payload.get("targetId") or "").strip()
                 with database() as connection:
@@ -5213,7 +8366,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
                 target_type, target_id, action, reason = str(payload.get("targetType") or ""), str(payload.get("targetId") or ""), str(payload.get("action") or ""), str(payload.get("reason") or "").strip()
                 if (target_type, action) not in (("product", "unlist_product"), ("shop", "pause_shop"), ("user", "disable_user")) or not reason:
                     raise ValueError("处罚参数无效")
@@ -5235,25 +8388,27 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Unauthorized"})
                     return
                 require_admin(user_id)
-                require_admin_step_up(self, user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
                 product_id = self.path.removeprefix("/api/admin/moderation/products/").rstrip("/")
                 decision = str(payload.get("decision") or "")
                 reason = str(payload.get("reason") or "").strip()
-                if decision not in ("approved", "rejected"):
+                if decision != "rejected":
                     raise ValueError("审核决定无效")
-                if decision == "rejected" and not reason:
+                if not reason:
                     raise ValueError("请填写驳回原因")
                 with database() as connection:
                     product = connection.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone()
                     if not product:
                         raise ValueError("作品不存在")
-                    connection.execute(
-                        "UPDATE products SET moderation_status = ?, moderation_reason = ?, moderated_at = CURRENT_TIMESTAMP, status = CASE WHEN ? = 'rejected' THEN 'unlisted' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (decision, reason or None, decision, product_id),
-                    )
-                    write_moderation_log(connection, product_id, f"manual:{decision}:{reason}", decision, reason or None)
+                    updated = connection.execute(
+                        "UPDATE products SET moderation_status = 'rejected', moderation_reason = ?, moderated_at = CURRENT_TIMESTAMP, status = 'unlisted', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'published'",
+                        (reason, product_id),
+                    ).rowcount
+                    if not updated:
+                        raise ValueError("作品未上架或已被处理")
+                    write_moderation_log(connection, product_id, f"manual:rejected:{reason}", "rejected", reason)
                     complete_governance_task(connection, "product_moderation", product_id, user_id)
-                    write_platform_audit(connection, user_id, f"product_{decision}", "product", product_id, {"reason": reason})
+                    write_platform_audit(connection, user_id, "product_unlisted", "product", product_id, {"reason": reason})
                 self.send_json(200, {"ok": True})
             elif self.path.startswith("/api/admin/reports/"):
                 user_id = session_user(self)
@@ -5295,6 +8450,8 @@ class Handler(BaseHTTPRequestHandler):
                 recipient = str(payload.get("recipient") or "").strip()
                 if not shop_id or amount_cents <= 0 or recipient_type not in ("bank", "wallet") or not recipient or len(recipient) > 500:
                     raise ValueError("提现申请参数无效")
+                if amount_cents < SETTLEMENT_MIN_PAYOUT_CENTS:
+                    raise ValueError(f"单次结算金额不得低于 ${SETTLEMENT_MIN_PAYOUT_CENTS / 100:.2f}")
                 with database() as connection:
                     connection.row_factory = sqlite3.Row
                     require_shop_owner(connection, user_id, shop_id)
@@ -5309,6 +8466,25 @@ class Handler(BaseHTTPRequestHandler):
                     write_wallet_ledger(connection, shop_id, "withdrawal_requested", withdrawal_id=withdrawal_id, available=-amount_cents, withdrawing=amount_cents, note="提现申请已提交")
                     write_platform_audit(connection, user_id, "seller_withdrawal_requested", "withdrawal", withdrawal_id, {"shopId": shop_id, "amountCents": amount_cents})
                 self.send_json(201, {"withdrawalId": withdrawal_id})
+            elif self.path == "/api/seller/finance/schedule":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                schedule = str(payload.get("schedule") or "").strip()
+                if schedule not in SELLER_PAYOUT_SCHEDULES:
+                    raise ValueError("结算周期仅支持每日、每周、双周或每月")
+                with database() as connection:
+                    if not is_seller(connection, user_id):
+                        self.send_json(403, {"error": "Seller access required"})
+                        return
+                    connection.execute("INSERT OR IGNORE INTO seller_profiles (user_id, verification_status) VALUES (?, 'pending')", (user_id,))
+                    connection.execute(
+                        "UPDATE seller_profiles SET payout_schedule = ?, payout_schedule_updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                        (schedule, user_id),
+                    )
+                    write_platform_audit(connection, user_id, "seller_payout_schedule_updated", "seller_finance", user_id, {"schedule": schedule})
+                self.send_json(200, {"payoutSchedule": schedule, "nextPayoutAt": payout_schedule_next_at(schedule)})
             elif self.path == "/api/seller/payout-account/onboarding":
                 user_id = session_user(self)
                 if not user_id:
@@ -5547,8 +8723,17 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         table, field = "buyer_shop_follows", "shop_id"
                     existing = connection.execute(f"SELECT 1 FROM {table} WHERE buyer_user_id = ? AND {field} = ?", (user_id, target)).fetchone()
-                    if existing: connection.execute(f"DELETE FROM {table} WHERE buyer_user_id = ? AND {field} = ?", (user_id, target))
-                    else: connection.execute(f"INSERT INTO {table} (buyer_user_id, {field}) VALUES (?, ?)", (user_id, target))
+                    if existing:
+                        connection.execute(f"DELETE FROM {table} WHERE buyer_user_id = ? AND {field} = ?", (user_id, target))
+                    else:
+                        if table == "buyer_favorites":
+                            product = connection.execute("SELECT shop_id FROM products WHERE id = ? AND status = 'published'", (target,)).fetchone()
+                            if not product:
+                                raise ValueError("Product not found")
+                            connection.execute(f"INSERT INTO {table} (buyer_user_id, {field}) VALUES (?, ?)", (user_id, target))
+                            record_analytics_event(connection, "favorite_added", user_id=user_id, shop_id=product[0], product_id=target, placement="product_detail")
+                        else:
+                            connection.execute(f"INSERT INTO {table} (buyer_user_id, {field}) VALUES (?, ?)", (user_id, target))
                     self.send_json(200, buyer_state(connection, user_id))
             elif self.path == "/api/messages/buyer":
                 user_id = session_user(self)
@@ -5556,10 +8741,15 @@ class Handler(BaseHTTPRequestHandler):
                 message_type = str(payload.get("type") or "text")
                 attachment_url = str(payload.get("attachmentUrl") or "").strip() or None
                 order_id = str(payload.get("orderId") or "").strip() or None
+                product_id = str(payload.get("productId") or "").strip() or None
                 if not user_id:
                     self.send_json(401, {"error": "Unauthorized"})
                     return
-                if not shop_id or message_type not in ("text", "image", "order"):
+                if not self.enforce_rate_limit(
+                    "shop-message", user_id, per_ip=120, per_user=40, window_seconds=60
+                ):
+                    return
+                if not shop_id or message_type not in ("text", "image", "order", "product"):
                     raise ValueError("消息参数无效")
                 if message_type == "text" and not content:
                     raise ValueError("请输入消息内容")
@@ -5567,34 +8757,56 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请上传图片")
                 if message_type == "order" and not order_id:
                     raise ValueError("请选择订单")
+                if message_type == "product" and not product_id:
+                    raise ValueError("请选择商品")
                 if len(content) > 500:
                     raise ValueError("消息不能超过 500 个字符")
                 seller_recipients: list[str] = []
+                notification_ids: list[str] = []
+                auto_reply_id: str | None = None
                 with database() as connection:
                     if not connection.execute("SELECT 1 FROM shops WHERE id = ?", (shop_id,)).fetchone():
                         raise ValueError("店铺不存在")
                     if order_id and not connection.execute("SELECT 1 FROM orders WHERE id = ? AND buyer_user_id = ? AND shop_id = ?", (order_id, user_id, shop_id)).fetchone():
                         raise ValueError("只能发送当前店铺的订单卡片")
+                    if product_id and not connection.execute("SELECT 1 FROM products WHERE id = ? AND shop_id = ? AND status = 'published'", (product_id, shop_id)).fetchone():
+                        raise ValueError("只能发送当前店铺的在售商品卡片")
                     message_id = f"message-{secrets.token_urlsafe(10)}"
-                    connection.execute("INSERT INTO shop_messages (id, shop_id, buyer_user_id, sender_role, sender_user_id, content, message_type, attachment_url, order_id) VALUES (?, ?, ?, 'buyer', ?, ?, ?, ?, ?)", (message_id, shop_id, user_id, user_id, content, message_type, attachment_url, order_id))
+                    stored_type = "text" if message_type == "product" else message_type
+                    connection.execute("INSERT INTO shop_messages (id, shop_id, buyer_user_id, sender_role, sender_user_id, content, message_type, attachment_url, order_id, product_id) VALUES (?, ?, ?, 'buyer', ?, ?, ?, ?, ?, ?)", (message_id, shop_id, user_id, user_id, content, stored_type, attachment_url, order_id, product_id))
                     if attachment_url:
                         link_media_assets(connection, [attachment_url], "message", message_id)
+                    buyer = connection.execute("SELECT display_name FROM users WHERE id = ?", (user_id,)).fetchone()
+                    buyer_name = (buyer[0] if buyer and buyer[0] else "买家")
                     owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,)).fetchone()
-                    if owner: notify_governance(connection, owner[0], "buyer_message", "收到买家消息", content[:80], "shop", shop_id)
+                    if owner: notify_governance(connection, owner[0], "buyer_message", f"{buyer_name} 发来消息", content[:80], "shop", shop_id)
+                    automation = apply_buyer_message_automation(connection, message_id, shop_id, user_id, content)
+                    auto_reply_id = automation.get("autoReplyMessageId") if isinstance(automation, dict) else None
+                    notification_ids = [row[0] for row in connection.execute("SELECT id FROM seller_message_notifications WHERE message_id = ? AND status = 'queued'", (message_id,)).fetchall()]
                     seller_recipients = shop_message_recipient_user_ids(connection, shop_id)
+                for notification_id in notification_ids:
+                    threading.Thread(target=dispatch_seller_message_notification, args=(notification_id,), daemon=True).start()
                 LIVE_MESSAGE_HUB.publish(seller_recipients, {"type": "message.new", "audience": "seller", "shopId": shop_id, "buyerUserId": user_id, "messageId": message_id})
-                enqueue_web_push_notifications(seller_recipients, {"title": "收到买家消息", "body": content[:80] or "买家发送了一条消息", "tag": f"shop-message-{shop_id}-{user_id}", "url": "/"})
+                enqueue_web_push_notifications(seller_recipients, {"title": f"{buyer_name} 发来消息", "body": content[:80] or f"{buyer_name} 发送了一条消息", "tag": f"shop-message-{shop_id}-{user_id}", "url": "/"})
+                if auto_reply_id:
+                    LIVE_MESSAGE_HUB.publish([user_id], {"type": "message.new", "audience": "buyer", "shopId": shop_id, "buyerUserId": user_id, "messageId": auto_reply_id})
+                    enqueue_web_push_notifications([user_id], {"title": "店铺已收到你的消息", "body": "店主当前处于非工作时间，请耐心等待。", "tag": f"shop-message-{shop_id}", "url": "/"})
                 self.send_json(201, {"ok": True})
             elif self.path == "/api/messages/seller":
                 user_id = session_user(self)
                 if not user_id:
                     self.send_json(401, {"error": "Unauthorized"})
                     return
+                if not self.enforce_rate_limit(
+                    "shop-message", user_id, per_ip=120, per_user=40, window_seconds=60
+                ):
+                    return
                 shop_id, buyer_id, content = str(payload.get("shopId") or ""), str(payload.get("buyerUserId") or ""), str(payload.get("content") or "").strip()
                 message_type = str(payload.get("type") or "text")
                 attachment_url = str(payload.get("attachmentUrl") or "").strip() or None
                 order_id = str(payload.get("orderId") or "").strip() or None
-                if not shop_id or not buyer_id or message_type not in ("text", "image", "order"):
+                product_id = str(payload.get("productId") or "").strip() or None
+                if not shop_id or not buyer_id or message_type not in ("text", "image", "order", "product"):
                     raise ValueError("消息参数无效")
                 if message_type == "text" and not content:
                     raise ValueError("请输入回复内容")
@@ -5602,14 +8814,20 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请上传图片")
                 if message_type == "order" and not order_id:
                     raise ValueError("请选择订单")
+                if message_type == "product" and not product_id:
+                    raise ValueError("请选择商品")
                 if len(content) > 500:
                     raise ValueError("消息不能超过 500 个字符")
                 with database() as connection:
                     require_shop_permission(connection, user_id, shop_id, "messages")
                     if order_id and not connection.execute("SELECT 1 FROM orders WHERE id = ? AND buyer_user_id = ? AND shop_id = ?", (order_id, buyer_id, shop_id)).fetchone():
                         raise ValueError("只能发送当前会话买家的订单卡片")
+                    if product_id and not connection.execute("SELECT 1 FROM products WHERE id = ? AND shop_id = ? AND status = 'published'", (product_id, shop_id)).fetchone():
+                        raise ValueError("只能发送当前店铺的在售商品卡片")
                     message_id = f"message-{secrets.token_urlsafe(10)}"
-                    connection.execute("INSERT INTO shop_messages (id, shop_id, buyer_user_id, sender_role, sender_user_id, content, message_type, attachment_url, order_id) VALUES (?, ?, ?, 'seller', ?, ?, ?, ?, ?)", (message_id, shop_id, buyer_id, user_id, content, message_type, attachment_url, order_id))
+                    stored_type = "text" if message_type == "product" else message_type
+                    connection.execute("INSERT INTO shop_messages (id, shop_id, buyer_user_id, sender_role, sender_user_id, content, message_type, attachment_url, order_id, product_id) VALUES (?, ?, ?, 'seller', ?, ?, ?, ?, ?, ?)", (message_id, shop_id, buyer_id, user_id, content, stored_type, attachment_url, order_id, product_id))
+                    connection.execute("UPDATE seller_message_attention SET status = 'acknowledged', updated_at = CURRENT_TIMESTAMP WHERE shop_id = ? AND buyer_user_id = ? AND status = 'open'", (shop_id, buyer_id))
                     if attachment_url:
                         link_media_assets(connection, [attachment_url], "message", message_id)
                     notify_governance(connection, buyer_id, "seller_message", "收到店铺回复", content[:80], "shop", shop_id)
@@ -5665,6 +8883,26 @@ class Handler(BaseHTTPRequestHandler):
                         owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (shop_id,)).fetchone()
                         if owner:
                             notify_governance(connection, owner[0], "support_ticket", "收到客服工单", subject, "support_ticket", ticket_id)
+                self.send_json(201, {"id": ticket_id})
+            elif self.path == "/api/seller/platform-support/tickets":
+                user_id = session_user(self)
+                if not user_id:
+                    self.send_json(401, {"error": "Unauthorized"})
+                    return
+                subject, content = str(payload.get("subject") or "").strip(), str(payload.get("content") or "").strip()
+                priority = str(payload.get("priority") or "normal")
+                if not 1 <= len(subject) <= 120 or not 1 <= len(content) <= 1000 or priority not in ("low", "normal", "high", "urgent"):
+                    raise ValueError("工单内容或优先级无效")
+                with database() as connection:
+                    if not is_seller(connection, user_id):
+                        self.send_json(403, {"error": "Seller access required"})
+                        return
+                    ticket_id = f"ticket-{secrets.token_urlsafe(10)}"
+                    message_id = f"ticket-message-{secrets.token_urlsafe(10)}"
+                    connection.execute("INSERT INTO support_tickets (id, buyer_user_id, subject, priority, requester_role) VALUES (?, ?, ?, ?, 'seller')", (ticket_id, user_id, subject, priority))
+                    connection.execute("INSERT INTO support_ticket_messages (id, ticket_id, sender_user_id, sender_role, content) VALUES (?, ?, ?, 'seller', ?)", (message_id, ticket_id, user_id, content))
+                    write_support_ticket_event(connection, ticket_id, "seller_platform_ticket_created", user_id, {"priority": priority})
+                    apply_support_automation(connection, ticket_id, content)
                 self.send_json(201, {"id": ticket_id})
             elif self.path.startswith("/api/support/tickets/") and self.path.endswith("/messages"):
                 user_id = session_user(self)
@@ -5722,8 +8960,13 @@ class Handler(BaseHTTPRequestHandler):
                 evidence = [str(item) for item in payload.get("evidence") or [] if str(item).startswith(("/media/", "http://", "https://"))][:6]
                 business_type = str(payload.get("businessType") or "individual")
                 representative, license_no, address = str(payload.get("legalRepresentative") or "").strip(), str(payload.get("businessLicenseNo") or "").strip(), str(payload.get("businessAddress") or "").strip()
+                categories = []
+                for category in payload.get("operatingCategories") or []:
+                    value = str(category).strip()
+                    if value and value not in categories:
+                        categories.append(value)
                 documents = [item for item in payload.get("documents") or [] if isinstance(item, dict) and str(item.get("url") or "").startswith(("/media/", "http://", "https://"))][:8]
-                if not 2 <= len(legal_name) <= 80 or not 6 <= len(identity_number) <= 32 or not re.fullmatch(r"\d{6,20}", contact_phone) or business_type not in ("individual", "enterprise") or (business_type == "enterprise" and (not representative or not license_no or not address)):
+                if not 2 <= len(legal_name) <= 80 or not re.fullmatch(r"[A-Za-z0-9]{6,32}", identity_number) or not re.fullmatch(r"\d{6,20}", contact_phone) or not 5 <= len(address) <= 300 or not categories or len(categories) > 10 or any(category not in SELLER_OPERATING_CATEGORIES for category in categories) or business_type not in ("individual", "enterprise") or (business_type == "enterprise" and (not representative or not license_no)):
                     raise ValueError("请完整填写认证信息")
                 with database() as connection:
                     connection.row_factory = sqlite3.Row
@@ -5732,18 +8975,25 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     pending = connection.execute("SELECT id FROM seller_verification_applications WHERE seller_user_id = ? AND status = 'pending'", (user_id,)).fetchone()
                     if pending:
-                        raise ValueError("已有认证申请正在审核，请等待审核结果")
-                    application_id = f"verification-{secrets.token_urlsafe(10)}"
-                    prior = connection.execute("SELECT id, review_round FROM seller_verification_applications WHERE seller_user_id = ? AND status = 'rejected' ORDER BY reviewed_at DESC LIMIT 1", (user_id,)).fetchone()
-                    review_round = int(prior["review_round"] or 1) + 1 if prior else 1
-                    connection.execute("INSERT INTO seller_verification_applications (id, seller_user_id, legal_name, identity_number, contact_phone, evidence_json, business_type, legal_representative, business_license_no, business_address, resubmission_of, review_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (application_id, user_id, legal_name, identity_number, contact_phone, json.dumps(evidence, ensure_ascii=False), business_type, representative or None, license_no or None, address or None, prior["id"] if prior else None, review_round))
+                        application_id = pending[0]
+                        connection.execute("UPDATE seller_verification_applications SET legal_name = ?, identity_number = ?, contact_phone = ?, evidence_json = ?, business_type = ?, legal_representative = ?, business_license_no = ?, business_address = ?, reviewer_user_id = NULL, review_note = NULL, rejection_code = NULL, expires_at = NULL, supplement_requested_at = NULL, supplement_due_at = NULL, reviewed_at = NULL WHERE id = ?", (legal_name, identity_number, contact_phone, json.dumps(evidence, ensure_ascii=False), business_type, representative or None, license_no or None, address or None, application_id))
+                        connection.execute("DELETE FROM seller_verification_documents WHERE application_id = ?", (application_id,))
+                    else:
+                        application_id = f"verification-{secrets.token_urlsafe(10)}"
+                        prior = connection.execute("SELECT id, review_round FROM seller_verification_applications WHERE seller_user_id = ? AND status = 'rejected' AND COALESCE(rejection_code, '') != 'seller_withdrew' ORDER BY reviewed_at DESC LIMIT 1", (user_id,)).fetchone()
+                        review_round = int(prior["review_round"] or 1) + 1 if prior else 1
+                        connection.execute("INSERT INTO seller_verification_applications (id, seller_user_id, legal_name, identity_number, contact_phone, evidence_json, business_type, legal_representative, business_license_no, business_address, resubmission_of, review_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (application_id, user_id, legal_name, identity_number, contact_phone, json.dumps(evidence, ensure_ascii=False), business_type, representative or None, license_no or None, address or None, prior["id"] if prior else None, review_round))
                     for document in documents:
                         document_type = str(document.get("type") or "other")
                         connection.execute("INSERT INTO seller_verification_documents (id, application_id, document_type, file_url) VALUES (?, ?, ?, ?)", (f"verification-document-{secrets.token_urlsafe(8)}", application_id, document_type if document_type in ("identity_front", "identity_back", "business_license", "authorization", "other") else "other", str(document["url"])))
-                    connection.execute("INSERT INTO seller_profiles (user_id, verification_status, legal_name, identity_number, contact_phone) VALUES (?, 'pending', ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET verification_status = 'pending', legal_name = excluded.legal_name, identity_number = excluded.identity_number, contact_phone = excluded.contact_phone", (user_id, legal_name, identity_number, contact_phone))
+                    verification_status = "approved" if AUTO_APPROVE_SELLER_VERIFICATION else "pending"
+                    connection.execute("INSERT INTO seller_profiles (user_id, verification_status, legal_name, identity_number, contact_phone, business_address, operating_categories_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET verification_status = excluded.verification_status, legal_name = excluded.legal_name, identity_number = excluded.identity_number, contact_phone = excluded.contact_phone, business_address = excluded.business_address, operating_categories_json = excluded.operating_categories_json", (user_id, verification_status, legal_name, identity_number, contact_phone, address, json.dumps(categories, ensure_ascii=False)))
+                    if AUTO_APPROVE_SELLER_VERIFICATION:
+                        connection.execute("UPDATE seller_verification_applications SET status = 'approved', review_note = '测试环境：资料格式校验通过，已自动认证', reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (application_id,))
+                        connection.execute("UPDATE seller_verification_documents SET status = 'accepted' WHERE application_id = ?", (application_id,))
                     link_media_assets(connection, evidence, "seller_verification", application_id)
                     write_platform_audit(connection, user_id, "seller_verification_submitted", "seller_verification", application_id)
-                self.send_json(201, {"id": application_id, "status": "pending"})
+                self.send_json(201, {"id": application_id, "status": "approved" if AUTO_APPROVE_SELLER_VERIFICATION else "submitted"})
             elif self.path == "/api/seller/staff":
                 user_id = session_user(self)
                 if not user_id:
@@ -5790,6 +9040,9 @@ class Handler(BaseHTTPRequestHandler):
                 city = str(payload.get("city") or "").strip()
                 district = str(payload.get("district") or "").strip()
                 detail = str(payload.get("detail") or "").strip()
+                country_code = str(payload.get("countryCode") or "").strip().upper()
+                if country_code not in SHIPPING_COUNTRIES:
+                    raise ValueError("请选择平台当前支持配送的国家或地区")
                 if not all((recipient, phone, province, city, district, detail)):
                     raise ValueError("请完整填写收货地址")
                 with database() as connection:
@@ -5801,10 +9054,10 @@ class Handler(BaseHTTPRequestHandler):
                     address_id = f"address-{secrets.token_urlsafe(10)}"
                     connection.execute(
                         """
-                        INSERT INTO buyer_addresses (id, buyer_user_id, recipient_name, recipient_phone, province, city, district, detail, postal_code, is_default)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO buyer_addresses (id, buyer_user_id, recipient_name, recipient_phone, province, city, district, detail, postal_code, country_code, country_name, is_default)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (address_id, user_id, recipient, phone, province, city, district, detail, str(payload.get("postalCode") or "").strip() or None, int(make_default)),
+                        (address_id, user_id, recipient, phone, province, city, district, detail, str(payload.get("postalCode") or "").strip() or None, country_code, SHIPPING_COUNTRIES[country_code], int(make_default)),
                     )
                     row = connection.execute("SELECT * FROM buyer_addresses WHERE id = ?", (address_id,)).fetchone()
                 self.send_json(201, {"address": address_for_response(row)})
@@ -5881,8 +9134,9 @@ class Handler(BaseHTTPRequestHandler):
                     if not carrier or not tracking_no:
                         raise ValueError("请填写快递公司和运单号")
                     shipment_id = f"shipment-{secrets.token_urlsafe(10)}"
+                    logistics_provider = logistics_provider_for_carrier(carrier)
                     connection.execute("UPDATE orders SET status = 'shipped', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (order["id"],))
-                    connection.execute("INSERT INTO shipments (id, order_id, carrier, tracking_no, status) VALUES (?, ?, ?, ?, 'in_transit')", (shipment_id, order["id"], carrier, tracking_no))
+                    connection.execute("INSERT INTO shipments (id, order_id, carrier, tracking_no, logistics_provider, provider_tracking_id, status) VALUES (?, ?, ?, ?, ?, ?, 'in_transit')", (shipment_id, order["id"], carrier, tracking_no, logistics_provider, tracking_no))
                     connection.execute("INSERT INTO shipment_events (id, shipment_id, event_at, label, detail) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)", (f"event-{secrets.token_urlsafe(8)}", shipment_id, "卖家已发货", f"{carrier} 已揽收"))
                     notify_governance(connection, order["buyer_user_id"], "order_shipped", "订单已发货", f"订单 {order['order_no']} 已由 {carrier} 发出", "order", order["order_no"])
                     self.send_json(200, {"orders": orders_for_response(connection, "id = ?", (order["id"],))})
@@ -5903,6 +9157,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not shipment or order["status"] not in ("shipped", "delivered"):
                         raise ValueError("该订单尚未发货")
                     connection.execute("INSERT INTO shipment_events (id, shipment_id, event_at, label, detail) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)", (f"event-{secrets.token_urlsafe(8)}", shipment["id"], label, detail))
+                    if re.search(r"异常|滞留|延误|退回|拒收|丢件", f"{label} {detail}"):
+                        buyer_phone = connection.execute("SELECT phone FROM users WHERE id = ?", (order["buyer_user_id"],)).fetchone()
+                        if buyer_phone:
+                            enqueue_tencent_sms_notification(buyer_phone[0], "logistics_alert")
                     self.send_json(200, {"orders": orders_for_response(connection, "id = ?", (order["id"],))})
             elif self.path.startswith("/api/orders/") and self.path.endswith("/receive"):
                 user_id = session_user(self)
@@ -5915,14 +9173,16 @@ class Handler(BaseHTTPRequestHandler):
                     order = connection.execute("SELECT * FROM orders WHERE order_no = ? AND buyer_user_id = ?", (order_no, user_id)).fetchone()
                     if not order:
                         raise ValueError("无权操作该订单")
+                    if order["status"] == "completed":
+                        self.send_json(200, {"orders": orders_for_response(connection, "id = ?", (order["id"],))})
+                        return
                     if order["status"] not in ("shipped", "delivered"):
                         raise ValueError("该订单尚未发货")
-                    connection.execute("UPDATE orders SET status = 'completed', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (order["id"],))
-                    connection.execute("UPDATE shipments SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP WHERE order_id = ?", (order["id"],))
-                    release_order_settlement(connection, order["id"])
+                    completed = complete_order_and_start_settlement_hold(connection, order["id"])
                     owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (order["shop_id"],)).fetchone()
-                    if owner: notify_governance(connection, owner[0], "order_completed", "订单已完成", f"订单 {order['order_no']} 已确认收货", "order", order["order_no"])
-                    notify_governance(connection, order["buyer_user_id"], "review_reminder", "订单已完成，等待评价", "分享你的使用感受，帮助更多手作爱好者", "order", order["order_no"])
+                    if completed:
+                        if owner: notify_governance(connection, owner[0], "order_completed", "订单已完成", f"订单 {order['order_no']} 已确认收货", "order", order["order_no"])
+                        notify_governance(connection, order["buyer_user_id"], "review_reminder", "订单已完成，等待评价", "分享你的使用感受，帮助更多手作爱好者", "order", order["order_no"])
                     self.send_json(200, {"orders": orders_for_response(connection, "id = ?", (order["id"],))})
             elif self.path.startswith("/api/orders/") and self.path.endswith("/cancel"):
                 user_id = session_user(self)
@@ -5964,12 +9224,28 @@ class Handler(BaseHTTPRequestHandler):
                     evidence = [str(image) for image in payload.get("evidence") or [] if str(image).startswith("data:image/")][:6]
                     connection.execute(
                         """
-                        INSERT INTO after_sale_requests (id, order_id, order_item_id, buyer_user_id, request_type, reason, requested_amount_cents, order_status_before)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO after_sale_requests (id, order_id, order_item_id, buyer_user_id, request_type, reason, requested_amount_cents, refund_currency, refund_exchange_rate, order_status_before)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (request_id, order["id"], item["id"] if item else None, user_id, request_type, str(payload.get("reason") or "七天无理由退款"), amount, order["status"]),
+                        (request_id, order["id"], item["id"] if item else None, user_id, request_type, str(payload.get("reason") or "七天无理由退款"), amount, order["payment_currency"], order["payment_exchange_rate"], order["status"]),
                     )
-                    connection.executemany("INSERT INTO after_sale_evidence (id, after_sale_id, image_url, sort_order) VALUES (?, ?, ?, ?)", [(f"evidence-{secrets.token_urlsafe(8)}", request_id, image, index) for index, image in enumerate(evidence)])
+                    connection.executemany(
+                        "INSERT INTO after_sale_evidence (id, after_sale_id, image_url, sort_order, content_hash, byte_size) VALUES (?, ?, ?, ?, ?, ?)",
+                        [
+                            (f"evidence-{secrets.token_urlsafe(8)}", request_id, image, index, hashlib.sha256(image.encode("utf-8")).hexdigest(), len(image.encode("utf-8")))
+                            for index, image in enumerate(evidence)
+                        ],
+                    )
+                    write_after_sale_case_event(
+                        connection, request_id, "buyer_submitted", actor_user_id=user_id,
+                        detail={"type": request_type, "amountCents": amount, "reason": str(payload.get("reason") or "")[:500]}, evidence=evidence,
+                    )
+                    recent_requests = connection.execute(
+                        "SELECT COUNT(*) FROM after_sale_requests WHERE buyer_user_id = ? AND created_at >= datetime('now', '-90 days')",
+                        (user_id,),
+                    ).fetchone()[0]
+                    if recent_requests >= 3:
+                        record_risk_case(connection, "refund_dispute", "medium", "repeated_after_sale_requests", subject_user_id=user_id, order_id=order["id"], detail={"requests90d": recent_requests})
                     connection.execute("UPDATE orders SET status = 'refunding', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (order["id"],))
                     owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (order["shop_id"],)).fetchone()
                     if owner: notify_governance(connection, owner[0], "after_sale", "收到售后申请", f"订单 {order['order_no']} 需要处理", "after_sale", request_id)
@@ -5992,6 +9268,7 @@ class Handler(BaseHTTPRequestHandler):
                     if request["status"] != "approved" or request["returned_at"]:
                         raise ValueError("该售后当前不能提交退货物流")
                     connection.execute("UPDATE after_sale_requests SET return_carrier = ?, return_tracking_no = ?, returned_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (carrier, tracking_no, request_id))
+                    write_after_sale_case_event(connection, request_id, "buyer_return_shipment_submitted", actor_user_id=user_id, detail={"carrier": carrier, "trackingNo": tracking_no})
                     order = connection.execute("SELECT shop_id, order_no FROM orders WHERE id = ?", (request["order_id"],)).fetchone()
                     owner = connection.execute("SELECT owner_user_id FROM shops WHERE id = ?", (order["shop_id"],)).fetchone()
                     if owner: notify_governance(connection, owner[0], "return_shipment", "买家已寄回作品", f"订单 {order['order_no']} 的退货物流已提交", "after_sale", request_id)
@@ -6013,11 +9290,15 @@ class Handler(BaseHTTPRequestHandler):
                     if not request or request["request_type"] != "return_refund" or request["status"] != "approved" or not request["returned_at"]:
                         raise ValueError("该售后当前不能确认收货")
                     connection.execute("UPDATE after_sale_requests SET status = 'completed', seller_response = ?, received_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (response_text, request_id))
-                    restore_order_inventory(connection, request["order_id"], status="reversed")
-                    connection.execute("UPDATE orders SET status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (request["order_id"],))
-                    reverse_order_settlement(connection, request["order_id"])
-                    set_campaign_redemption_status(connection, request["order_id"], "reversed")
-                    set_activity_allocation_status(connection, request["order_id"], "reversed")
+                    write_after_sale_case_event(connection, request_id, "seller_received_return", actor_user_id=user_id, detail={"response": response_text[:1000]})
+                    refund = record_after_sale_refund(connection, request_id)
+                    if refund["fullyRefunded"]:
+                        restore_order_inventory(connection, request["order_id"], status="reversed")
+                        connection.execute("UPDATE orders SET status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (request["order_id"],))
+                        set_campaign_redemption_status(connection, request["order_id"], "reversed")
+                        set_activity_allocation_status(connection, request["order_id"], "reversed")
+                    else:
+                        connection.execute("UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (request["order_status_before"] or "completed", request["order_id"]))
                     notify_governance(connection, request["buyer_user_id"], "refund_completed", "退款已完成", response_text, "after_sale", request_id)
                     self.send_json(200, {"afterSales": after_sales_for_response(connection, "after_sale_requests.id = ?", (request_id,))})
             elif self.path.startswith("/api/after-sales/") and self.path.endswith(("/approve", "/reject")):
@@ -6053,11 +9334,14 @@ class Handler(BaseHTTPRequestHandler):
                         connection.execute("UPDATE after_sale_requests SET status = 'approved', seller_response = ?, seller_processed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (response_text, request_id))
                     else:
                         connection.execute("UPDATE after_sale_requests SET status = 'completed', seller_response = ?, seller_processed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (response_text, request_id))
-                        restore_order_inventory(connection, request["order_id"], status="reversed")
-                        connection.execute("UPDATE orders SET status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (request["order_id"],))
-                        reverse_order_settlement(connection, request["order_id"])
-                        set_campaign_redemption_status(connection, request["order_id"], "reversed")
-                        set_activity_allocation_status(connection, request["order_id"], "reversed")
+                        refund = record_after_sale_refund(connection, request_id)
+                        if refund["fullyRefunded"]:
+                            connection.execute("UPDATE orders SET status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (request["order_id"],))
+                            set_campaign_redemption_status(connection, request["order_id"], "reversed")
+                            set_activity_allocation_status(connection, request["order_id"], "reversed")
+                        else:
+                            connection.execute("UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (request["order_status_before"] or "completed", request["order_id"]))
+                    write_after_sale_case_event(connection, request_id, f"seller_{action}", actor_user_id=user_id, detail={"response": response_text[:1000], "requestType": request["request_type"]})
                     notify_governance(connection, request["buyer_user_id"], "after_sale_result", "售后申请处理结果", response_text, "after_sale", request_id)
                     self.send_json(200, {"afterSales": after_sales_for_response(connection, "after_sale_requests.id = ?", (request_id,))})
             elif self.path.startswith("/api/orders/") and self.path.endswith("/review"):
@@ -6137,6 +9421,7 @@ class Handler(BaseHTTPRequestHandler):
                 token = next((part.strip().split("=", 1)[1] for part in self.headers.get("Cookie", "").split(";") if part.strip().startswith("handicrafts_session=")), None)
                 if token:
                     with database() as connection:
+                        connection.execute("DELETE FROM admin_step_up_tickets WHERE session_token_hash = ?", (token_hash(token),))
                         connection.execute("DELETE FROM web_sessions WHERE token = ?", (token,))
                 self.send_json(200, {"ok": True}, "handicrafts_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
             elif self.path == "/api/auth/delete-account":
@@ -6147,8 +9432,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not user_id:
                     self.send_json(401, {"error": "Unauthorized"})
                     return
-                if confirmation != "注销账号":
-                    raise ValueError("请输入“注销账号”确认操作")
+                if confirmation not in ("注销账号", "CLOSE ACCOUNT"):
+                    raise ValueError("请输入“注销账号”或 “CLOSE ACCOUNT” 确认操作")
                 if len(reason) > 300:
                     raise ValueError("注销原因不能超过 300 个字符")
                 with database() as connection:
@@ -6194,29 +9479,38 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/auth/login":
                 identifier = (payload.get("identifier") or "").lower()
                 password = payload.get("password") or ""
-                client_ip = self.client_address[0]
-                if not login_allowed(client_ip):
-                    self.send_json(429, {"error": "登录失败次数过多，请 10 分钟后再试"})
+                identifier_subject = f"login:{hashlib.sha256(identifier.encode('utf-8')).hexdigest()[:24]}"
+                if not self.enforce_rate_limit(
+                    "login", identifier_subject, per_ip=30, per_user=10, window_seconds=600
+                ):
+                    return
+                visitor_ip = client_ip(self)
+                if not login_allowed(visitor_ip):
+                    self.send_json(
+                        429,
+                        {"error": "登录失败次数过多，请 10 分钟后再试", "retryAfter": 600},
+                        extra_headers={"Retry-After": "600"},
+                    )
                     return
                 with database() as connection:
                     connection.row_factory = sqlite3.Row
                     user = connection.execute("SELECT * FROM users WHERE status = 'active' AND (phone = ? OR lower(email) = ?)", (identifier, identifier)).fetchone()
                 valid, legacy = verify_password(password, user["password_hash"]) if user else (False, False)
                 if not user or not valid:
-                    register_login_failure(client_ip)
+                    register_login_failure(visitor_ip)
                     with database() as connection:
                         write_login_audit(connection, identifier, False, self, user["id"] if user else None, "invalid_credentials")
                     self.send_json(401, {"error": "账号或密码不正确"})
                     return
-                LOGIN_FAILURES.pop(client_ip, None)
+                clear_login_failures(visitor_ip)
                 if legacy:
                     with database() as connection:
                         connection.execute("UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (hash_password(password), user["id"]))
                 with database() as connection:
                     connection.execute("UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],))
                     write_login_audit(connection, identifier, True, self, user["id"])
-                token = create_session(user["id"], self)
-                self.send_json(200, {"account": account_for_user(user["id"])}, session_cookie(token))
+                token, csrf_token = create_session(user["id"], self)
+                self.send_json(200, {"account": account_for_user(user["id"])}, session_cookie(token), {"X-CSRF-Token": csrf_token})
             elif self.path == "/api/auth/request-verification":
                 destination = str(payload.get("destination") or "").strip().lower()
                 purpose = str(payload.get("purpose") or "")
@@ -6224,6 +9518,8 @@ class Handler(BaseHTTPRequestHandler):
                 if purpose not in ("contact_verify", "password_reset") or not destination:
                     raise ValueError("验证请求无效")
                 authenticated_user_id = session_user(self)
+                if not sms_request_allowed(self, destination, purpose):
+                    raise ValueError("发送过于频繁，请 1 分钟后再试")
                 with database() as connection:
                     user = connection.execute("SELECT id FROM users WHERE phone = ? OR lower(email) = ?", (destination, destination)).fetchone()
                     if purpose == "password_reset" and not user:
@@ -6240,25 +9536,42 @@ class Handler(BaseHTTPRequestHandler):
                             if not owned:
                                 raise ValueError("只能验证当前账号已绑定的联系方式")
                     code = issue_verification(connection, user[0] if user else authenticated_user_id, destination, purpose)
-                self.send_json(200, {"ok": True, **({"developmentCode": code} if not PRODUCTION_HTTPS else {})})
+                    registration_test_code = REGISTRATION_TEST_MODE and registration and purpose == "contact_verify"
+                    sms_sent = False if registration_test_code else deliver_verification_code(destination, purpose, code)
+                response = {"ok": True}
+                if registration_test_code:
+                    response["testingCode"] = code
+                elif not sms_sent and not PRODUCTION_HTTPS:
+                    response["developmentCode"] = code
+                self.send_json(200, response)
             elif self.path == "/api/auth/request-admin-step-up":
                 user_id = session_user(self)
                 if not user_id:
                     self.send_json(401, {"error": "Unauthorized"})
                     return
+                if not sms_request_allowed(self, user_id, "admin_step_up"):
+                    raise ValueError("发送过于频繁，请 1 分钟后再试")
                 with database() as connection:
                     if not is_admin(connection, user_id):
                         self.send_json(403, {"error": "Administrator access required"})
                         return
                     destination = admin_verification_destination(connection, user_id)
                     code = issue_verification(connection, user_id, destination, "admin_step_up")
-                self.send_json(200, {"ok": True, **({"developmentCode": code} if not PRODUCTION_HTTPS else {})})
+                    sms_sent = deliver_verification_code(destination, "admin_step_up", code)
+                self.send_json(200, {"ok": True, **({"developmentCode": code} if not sms_sent and not PRODUCTION_HTTPS else {})})
             elif self.path == "/api/auth/confirm-admin-step-up":
                 user_id = session_user(self)
+                current_session = session_token(self)
                 code = str(payload.get("code") or "").strip()
-                if not user_id:
+                # Older deployed admin screens do not send a scope. Treat those
+                # requests as high-risk so they remain compatible without
+                # weakening the fresh-verification requirement.
+                scope = str(payload.get("scope") or "high_risk")
+                if not user_id or not current_session:
                     self.send_json(401, {"error": "Unauthorized"})
                     return
+                if scope not in ("standard", "high_risk"):
+                    raise ValueError("Invalid administrator verification scope")
                 with database() as connection:
                     if not is_admin(connection, user_id):
                         self.send_json(403, {"error": "Administrator access required"})
@@ -6273,10 +9586,10 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     ticket = secrets.token_urlsafe(32)
                     connection.execute(
-                        "INSERT INTO admin_step_up_tickets (id, user_id, ticket_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+10 minutes'))",
-                        (f"step-up-{secrets.token_urlsafe(10)}", user_id, token_hash(ticket)),
+                        "INSERT INTO admin_step_up_tickets (id, user_id, ticket_hash, session_token_hash, scope, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+1 hour'))",
+                        (f"step-up-{secrets.token_urlsafe(10)}", user_id, token_hash(ticket), token_hash(current_session), scope),
                     )
-                self.send_json(200, {"ticket": ticket, "expiresIn": 600})
+                self.send_json(200, {"ticket": ticket, "expiresIn": 3600, "scope": scope})
             elif self.path == "/api/auth/reset-password":
                 destination = str(payload.get("destination") or "").strip().lower()
                 code, password = str(payload.get("code") or ""), str(payload.get("password") or "")
@@ -6344,15 +9657,27 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("联系方式不属于当前账号")
                 self.send_json(200, {"ok": True})
             elif self.path == "/api/auth/register":
-                user_id = f"user-{int(datetime.now().timestamp() * 1000)}"
+                # A timestamp can collide when a browser retries a request in
+                # the same millisecond. Registration IDs must be independent
+                # of request timing.
+                user_id = f"user-{secrets.token_urlsafe(12)}"
                 name = (payload.get("name") or "").strip()
                 phone = (payload.get("phone") or "").strip() or None
                 email = (payload.get("email") or "").strip().lower() or None
+                contact = phone or email
+                contact_subject = (
+                    f"registration:{hashlib.sha256(contact.encode('utf-8')).hexdigest()[:24]}"
+                    if contact
+                    else None
+                )
+                if not self.enforce_rate_limit(
+                    "registration", contact_subject, per_ip=12, per_user=3, window_seconds=3600
+                ):
+                    return
                 password = payload.get("password") or ""
                 confirm_password = payload.get("confirmPassword") or ""
                 phone_verification_code = str(payload.get("phoneVerificationCode") or "").strip()
                 role = payload.get("role") if payload.get("role") in ("buyer", "seller") else "buyer"
-                seller_profile = payload.get("sellerProfile") if isinstance(payload.get("sellerProfile"), dict) else {}
                 if not name or not password:
                     raise ValueError("请填写昵称、密码和至少一种登录账号")
                 if role == "seller" and not phone:
@@ -6365,25 +9690,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("密码至少需要 8 位")
                 if password != confirm_password:
                     raise ValueError("两次输入的密码不一致")
-                real_name = str(seller_profile.get("realName") or "").strip()
-                identity_number = str(seller_profile.get("identityNumber") or "").strip()
-                business_address = str(seller_profile.get("address") or "").strip()
-                payout_provider = str(seller_profile.get("payoutProvider") or "lianlian")
-                categories = []
-                for category in seller_profile.get("operatingCategories") or []:
-                    value = str(category).strip()
-                    if value and value not in categories:
-                        categories.append(value)
                 if role == "seller":
                     if not phone_verification_code:
                         raise ValueError("请先完成手机号验证")
-                    if not 2 <= len(real_name) <= 80 or not 6 <= len(identity_number) <= 32 or not 5 <= len(business_address) <= 300:
-                        raise ValueError("请完整填写真实姓名、身份证号和经营地址")
-                    if payout_provider != "lianlian":
-                        raise ValueError("目前仅支持绑定连连收款账户")
-                    if not categories or len(categories) > 10 or any(category not in SELLER_OPERATING_CATEGORIES for category in categories):
-                        raise ValueError("请至少选择一个有效的经营类目")
                 with database() as connection:
+                    # Check before consuming a seller verification code. A retry
+                    # with an existing contact should guide the user to login,
+                    # rather than spending a valid one-time code and returning a
+                    # database-level error in English.
+                    if phone and connection.execute("SELECT 1 FROM users WHERE phone = ?", (phone,)).fetchone():
+                        raise ValueError("该手机号已注册，请直接登录或更换手机号")
+                    if email and connection.execute("SELECT 1 FROM users WHERE lower(email) = ?", (email,)).fetchone():
+                        raise ValueError("该邮箱已注册，请直接登录或更换邮箱")
                     if role == "seller":
                         verification = consume_verification(connection, phone, "contact_verify", phone_verification_code)
                         if not verification or verification["user_id"] is not None:
@@ -6391,30 +9709,78 @@ class Handler(BaseHTTPRequestHandler):
                     connection.execute("INSERT INTO users (id, display_name, phone, email, password_hash) VALUES (?, ?, ?, ?, ?)", (user_id, name, phone, email, hash_password(password)))
                     connection.execute("INSERT INTO user_roles (user_id, role) VALUES (?, ?)", (user_id, role))
                     if role == "seller":
-                        application_id = f"verification-{secrets.token_urlsafe(10)}"
-                        connection.execute(
-                            "INSERT INTO seller_profiles (user_id, verification_status, legal_name, identity_number, contact_phone, business_address, payout_method, payout_account, operating_categories_json, payout_provider, payout_binding_status) VALUES (?, 'pending', ?, ?, ?, ?, NULL, NULL, ?, 'lianlian', 'unbound')",
-                            (user_id, real_name, identity_number, phone, business_address, json.dumps(categories, ensure_ascii=False)),
-                        )
-                        connection.execute(
-                            "INSERT INTO seller_verification_applications (id, seller_user_id, legal_name, identity_number, contact_phone, evidence_json, business_type, business_address) VALUES (?, ?, ?, ?, ?, '[]', 'individual', ?)",
-                            (application_id, user_id, real_name, identity_number, phone, business_address),
-                        )
-                        write_platform_audit(connection, user_id, "seller_verification_submitted", "seller_verification", application_id, {"source": "registration"})
-                token = create_session(user_id, self)
-                self.send_json(201, {"account": account_for_user(user_id)}, session_cookie(token))
+                        connection.execute("INSERT INTO seller_profiles (user_id, verification_status, contact_phone, payout_provider, payout_binding_status) VALUES (?, 'pending', ?, 'lianlian', 'unbound')", (user_id, phone))
+                if role == "seller":
+                    enqueue_tencent_sms_notification(phone, "seller_accepted")
+                token, csrf_token = create_session(user_id, self)
+                self.send_json(201, {"account": account_for_user(user_id)}, session_cookie(token), {"X-CSRF-Token": csrf_token})
             else:
                 self.send_json(404, {"error": "Not found"})
         except StepUpRequiredError:
             self.send_json(403, {"error": "请先完成管理员二次验证"})
         except (ValueError, json.JSONDecodeError) as error:
             self.send_json(400, {"error": str(error)})
-        except sqlite3.IntegrityError:
-            self.send_json(409, {"error": "Phone number or email is already registered"})
+        except sqlite3.IntegrityError as error:
+            if self.path == "/api/auth/register":
+                detail = str(error).lower()
+                if "users.phone" in detail:
+                    message = "该手机号已注册，请直接登录或更换手机号"
+                elif "users.email" in detail:
+                    message = "该邮箱已注册，请直接登录或更换邮箱"
+                else:
+                    print(f"Registration data conflict: {error}")
+                    message = "注册信息保存冲突，请重新获取验证码后再试"
+                self.send_json(409, {"error": message})
+            else:
+                self.send_json(409, {"error": "Data integrity error" if PRODUCTION_HTTPS else f"Data integrity error: {error}"})
         except Exception as error:
-            self.send_json(500, {"error": str(error)})
+            print(f"Unhandled API error on {self.path}: {error}")
+            self.send_json(500, {"error": "Internal server error" if PRODUCTION_HTTPS else str(error)})
 
     def do_PUT(self) -> None:
+        if not self.enforce_state_change_protection():
+            return
+        request_length = self.request_body_length()
+        if request_length is None:
+            return
+        if self.path.startswith("/api/admin/community/posts/"):
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                require_admin(user_id)
+                length = request_length
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                post_id = self.path.removeprefix("/api/admin/community/posts/").rstrip("/")
+                title = re.sub(r"\s+", " ", str(payload.get("title") or "").strip())
+                content = str(payload.get("content") or "").strip()
+                image_url = str(payload.get("imageUrl") or "").strip()
+                if not post_id or not 2 <= len(title) <= 80 or not 2 <= len(content) <= 2000:
+                    raise ValueError("帖子标题或正文长度无效")
+                if image_url and not image_url.startswith(("/media/", "http://", "https://")):
+                    raise ValueError("帖子图片地址无效")
+                if next((word for word in SENSITIVE_CONTENT_WORDS if word in f"{title}\n{content}"), None):
+                    raise ValueError("内容包含不允许发布的词语")
+                with database() as connection:
+                    updated = connection.execute(
+                        "UPDATE community_posts SET title = ?, content = ?, attachment_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'published'",
+                        (title, content, image_url, post_id),
+                    ).rowcount
+                    if not updated:
+                        raise ValueError("帖子不存在或已处理")
+                    connection.execute("DELETE FROM community_post_images WHERE post_id = ?", (post_id,))
+                    if image_url:
+                        connection.execute("INSERT INTO community_post_images (id, post_id, image_url, sort_order) VALUES (?, ?, ?, 0)", (f"community-post-image-{secrets.token_urlsafe(8)}", post_id, image_url))
+                    if post_id.startswith("community-announcement-"):
+                        announcement_id = post_id.removeprefix("community-announcement-")
+                        connection.execute("UPDATE platform_announcements SET title = ?, content = ?, image_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (title, content, image_url, announcement_id))
+                    write_platform_audit(connection, user_id, "community_post_edited", "community_post", post_id)
+                COMMUNITY_LIVE_HUB.publish({"type": "community_post_updated", "postId": post_id})
+                self.send_json(200, {"ok": True})
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"error": str(error)})
+            return
         if self.path.startswith("/api/admin/search-operations/"):
             user_id = session_user(self)
             if not user_id:
@@ -6423,7 +9789,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 require_admin(user_id)
                 require_admin_step_up(self, user_id)
-                length = int(self.headers.get("Content-Length", "0"))
+                length = request_length
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 kind, rule_id = self.path.removeprefix("/api/admin/search-operations/").strip("/").split("/", 1)
                 table = {"synonym": "search_synonyms", "correction": "search_corrections", "recommendation": "search_recommendations", "zero_result": "search_zero_result_rules"}.get(kind)
@@ -6449,7 +9815,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                length = request_length
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 reply_id = self.path.removeprefix("/api/messages/quick-replies/").rstrip("/")
                 content, category = str(payload.get("content") or "").strip(), str(payload.get("category") or "general").strip()[:30] or "general"
@@ -6471,7 +9837,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                length = request_length
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 staff_id = self.path.removeprefix("/api/seller/staff/").rstrip("/")
                 role, status = str(payload.get("role") or ""), str(payload.get("status") or "active")
@@ -6495,7 +9861,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                length = request_length
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 name = str(payload.get("name") or "").strip()
                 bio = str(payload.get("bio") or "").strip()
@@ -6556,7 +9922,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             address_id = self.path.rsplit("/", 1)[-1]
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                length = request_length
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 with database() as connection:
                     connection.row_factory = sqlite3.Row
@@ -6573,11 +9939,16 @@ class Handler(BaseHTTPRequestHandler):
                         "district": str(payload.get("district", existing["district"])).strip(),
                         "detail": str(payload.get("detail", existing["detail"])).strip(),
                         "postal_code": str(payload.get("postalCode", existing["postal_code"] or "")).strip() or None,
+                        "country_code": str(payload.get("countryCode", existing["country_code"] or "US")).strip().upper(),
+                        "country_name": "",
                         "is_default": int(bool(payload.get("isDefault", existing["is_default"]))),
                     }
+                    if fields["country_code"] not in SHIPPING_COUNTRIES:
+                        raise ValueError("请选择平台当前支持配送的国家或地区")
+                    fields["country_name"] = SHIPPING_COUNTRIES[fields["country_code"]]
                     if not all(fields[key] for key in ("recipient_name", "recipient_phone", "province", "city", "district", "detail")):
                         raise ValueError("请完整填写收货地址")
-                    connection.execute("UPDATE buyer_addresses SET recipient_name = ?, recipient_phone = ?, province = ?, city = ?, district = ?, detail = ?, postal_code = ?, is_default = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (*fields.values(), address_id))
+                    connection.execute("UPDATE buyer_addresses SET recipient_name = ?, recipient_phone = ?, province = ?, city = ?, district = ?, detail = ?, postal_code = ?, country_code = ?, country_name = ?, is_default = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (*fields.values(), address_id))
                     row = connection.execute("SELECT * FROM buyer_addresses WHERE id = ?", (address_id,)).fetchone()
                 self.send_json(200, {"address": address_for_response(row)})
             except (ValueError, json.JSONDecodeError) as error:
@@ -6591,7 +9962,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(401, {"error": "Unauthorized"})
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = request_length
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             state = payload.get("state")
             if not isinstance(state, dict):
@@ -6609,6 +9980,72 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": str(error)})
 
     def do_DELETE(self) -> None:
+        if not self.enforce_state_change_protection():
+            return
+        if self.path == "/api/seller/verification":
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                with database() as connection:
+                    if not is_seller(connection, user_id):
+                        self.send_json(403, {"error": "Seller access required"})
+                        return
+                    application = connection.execute(
+                        "SELECT id FROM seller_verification_applications WHERE seller_user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                        (user_id,),
+                    ).fetchone()
+                    if not application:
+                        raise ValueError("没有可撤回的审核中认证申请")
+                    # The original schema only permits pending/approved/rejected.
+                    # Keep a distinct withdrawal marker in rejection_code so the
+                    # request remains auditable without appearing as a failed review.
+                    connection.execute(
+                        "UPDATE seller_verification_applications SET status = 'rejected', rejection_code = 'seller_withdrew', review_note = '卖家已撤回，未进入平台审核', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'",
+                        (application[0],),
+                    )
+                    connection.execute(
+                        "UPDATE seller_profiles SET verification_status = 'pending', verification_expires_at = NULL, verification_expiry_notified_at = NULL WHERE user_id = ?",
+                        (user_id,),
+                    )
+                    write_platform_audit(connection, user_id, "seller_verification_withdrawn", "seller_verification", application[0])
+                self.send_json(200, {"ok": True})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+            return
+        if self.path.startswith("/api/admin/community/posts/"):
+            user_id = session_user(self)
+            if not user_id:
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                require_admin(user_id)
+                require_admin_step_up(self, user_id, force_fresh=True)
+                post_id = self.path.removeprefix("/api/admin/community/posts/").rstrip("/")
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                reason = str(payload.get("reason") or "").strip()
+                if not 2 <= len(reason) <= 500:
+                    raise ValueError("请填写 2 到 500 个字的删除原因")
+                with database() as connection:
+                    deleted = connection.execute(
+                        """
+                        UPDATE community_posts
+                        SET status = 'deleted', is_pinned = 0, pinned_at = NULL, pinned_by_user_id = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status = 'published'
+                        """,
+                        (post_id,),
+                    ).rowcount
+                    if not deleted:
+                        raise ValueError("帖子不存在或已处理")
+                    write_platform_audit(connection, user_id, "community_post_deleted", "community_post", post_id, {"reason": reason})
+                COMMUNITY_LIVE_HUB.publish({"type": "community_post_updated", "postId": post_id})
+                self.send_json(200, {"ok": True})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+            return
         if self.path.startswith("/api/admin/search-operations/"):
             user_id = session_user(self)
             if not user_id:
@@ -6706,6 +10143,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    validate_production_configuration()
     port = int(os.environ.get("HANDICRAFTS_PORT", "8787"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     expiry_stop_event = threading.Event()

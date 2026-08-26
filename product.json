@@ -1,0 +1,44 @@
+[
+  {
+    "title": "哈里斯粗花呢布艺笔袋哈里斯原创手工收纳大容量简约文具袋",
+    "price": 129,
+    "stock": 20,
+    "category": "布艺",
+    "description": "纯手工制作，哈里斯粗花呢羊毛，日常收纳。",
+    "images": [
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图1.png",
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图2.jpg",
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图3.jpg",
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图4.jpg"
+    ],
+    "tags": ["哈里斯粗花呢", "笔袋", "收纳袋", "手工制作"],
+    "customizable": true,
+    "weight": {
+      "value": 80,
+      "unit": "g"
+    },
+    "dimensions": {
+      "length": 20,
+      "width": 5,
+      "height": 5,
+      "unit": "cm"
+    },
+    "variants": [
+      {
+        "name": "泰晤士河",
+        "sku": "CUP-A8K2M9QX",
+        "price": 129,
+        "stock": 12,
+        "image": "E:\\Independent_website\\裁缝地图\\笔袋1\\SKU\\01.png"
+      },
+      {
+        "name": "西太后",
+        "sku": "CUP-R4N7P2LD",
+        "price": 129,
+        "stock": 8,
+        "image": "E:\\Independent_website\\裁缝地图\\笔袋1\\SKU\\02.png"
+      }
+    ],
+    "status": "published"
+  }
+]

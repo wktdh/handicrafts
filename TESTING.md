@@ -14,7 +14,7 @@ On a machine without Playwright browsers, install Chromium once before running E
 npx playwright install chromium
 ```
 
-E2E starts the SQLite API on port `8787` and Vite on port `5174` when those services are not already running. Failures retain a Playwright trace and screenshot under `test-results/`.
+E2E starts the SQLite API on port `8788` and Vite on port `5174` when those services are not already running. On Windows it prefers `venv\\Scripts\\python.exe` so media validation runs with the project's Python dependencies. Failures retain a Playwright trace and screenshot under `test-results/`.
 
 ## SQLite Protection
 

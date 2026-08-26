@@ -1,4 +1,5 @@
 node_modules/
+.tmp_*/
 dist/
 coverage/
 .vite/
@@ -23,3 +24,21 @@ __pycache__/
 *.db-shm
 *.db-wal
 database/backups/
+# 虚拟环境
+venv/
+.codex/
+outputs/
+readme_b64.txt
+*.encoding-damaged-*
+*.pem
+*.key
+
+# 缓存
+__pycache__/
+*.pyc
+
+# 密钥环境文件
+.env
+
+# VSCode配置
+.vscode/

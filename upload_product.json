@@ -1,0 +1,27 @@
+[
+  {
+    "title": "哈里斯粗花呢布艺笔袋哈里斯原创手工收纳大容量简约文具袋",
+    "price": 129,
+    "stock": 20,
+    "category": "布艺",
+    "description": "纯手工制作，哈里斯粗花呢羊毛，日常收纳。",
+    "images": [
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图1.jpg",
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图2.jpg",
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图3.jpg",
+      "E:\\Independent_website\\裁缝地图\\笔袋1\\主图4.jpg"
+    ],
+    "status": "published"
+  },
+  {
+    "title": "哈里斯粗花呢A6按扣手账本活页手帐本本子可拆卸随身日记本",
+    "price": 168,
+    "stock": 10,
+    "category": "布艺",
+    "description": "纯手工制作，哈里斯粗花呢羊毛，A6手账本。",
+    "images": [
+      "E:\\Independent_website\\裁缝地图\\手账本A6\\主图1.jpg"
+    ],
+    "status": "published"
+  }
+]

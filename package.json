@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "test:backend": "python -m unittest discover -s database/tests -v",
+    "build": "tsc -b && vite build && node scripts/generate-category-pages.mjs",
+    "test": "npm run test:frontend",
+    "test:backend": "node scripts/run-backend-tests.mjs",
     "test:frontend": "vitest run",
     "test:e2e": "playwright test",
     "test:all": "npm run test:backend && npm run test:frontend && npm run build && npm run test:e2e",
@@ -14,12 +15,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource/lato": "^5.3.0",
     "@vitejs/plugin-react": "4.3.4",
     "lucide-react": "0.468.0",
     "react": "18.3.1",
+    "react-colorful": "^5.8.0",
     "react-dom": "18.3.1",
     "typescript": "5.7.3",
-    "vite": "5.4.14"
+    "vite": "5.4.21"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.0",

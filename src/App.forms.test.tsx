@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { AfterSaleForm, AuthScreen, ReviewForm, ShipmentForm } from "./App";
+import { AuthScreen } from "./App";
+import { AfterSaleForm, ReviewForm, ShipmentForm } from "./pages/orders/OrderForms";
 
 const order = { id: "ORDER-TEST", amount: 168 } as Parameters<typeof AfterSaleForm>[0]["order"];
 
@@ -68,7 +69,7 @@ describe("buyer and seller forms", () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const { container } = render(<ReviewForm order={order} onSubmit={onSubmit} onCancel={vi.fn()} />);
 
-    fireEvent.click(within(container).getByRole("button", { name: "2 星" }));
+    fireEvent.click(within(container).getByRole("button", { name: "2 stars" }));
     fireEvent.change(within(container).getByTestId("review-content"), { target: { value: "Good details" } });
     fireEvent.click(within(container).getByTestId("review-submit"));
 
@@ -102,7 +103,7 @@ describe("buyer and seller forms", () => {
     expect(within(container).getByTestId("auth-confirm-password")).toBeInTheDocument();
   });
 
-  it("collects and submits seller operating details on a second registration step", async () => {
+  it("registers a seller directly and defers operating details to the workspace", async () => {
     const onRegister = vi.fn().mockResolvedValue("");
     const { container } = render(<AuthScreen onLogin={vi.fn()} onRegister={onRegister} onBack={vi.fn()} />);
 
@@ -115,16 +116,8 @@ describe("buyer and seller forms", () => {
     fireEvent.change(within(container).getByTestId("auth-confirm-password"), { target: { value: "password-123" } });
     fireEvent.click(within(container).getByTestId("auth-submit"));
 
-    expect(within(container).getByTestId("seller-real-name")).toBeInTheDocument();
-    fireEvent.change(within(container).getByTestId("seller-real-name"), { target: { value: "Seller Test" } });
-    fireEvent.change(within(container).getByTestId("seller-identity-number"), { target: { value: "110101199001011234" } });
-    fireEvent.change(within(container).getByTestId("seller-address"), { target: { value: "北京市朝阳区手作路 1 号" } });
-    fireEvent.change(within(container).getByTestId("seller-category-select"), { target: { value: "陶艺陶瓷" } });
-    fireEvent.click(within(container).getByTestId("auth-submit"));
-
     await waitFor(() => expect(onRegister).toHaveBeenCalledWith(
       "Seller Test", "13800138000", "", "password-123", "password-123", "123456", "seller",
-      expect.objectContaining({ realName: "Seller Test", payoutProvider: "lianlian", operatingCategories: ["陶艺陶瓷"] }),
     ));
   });
 

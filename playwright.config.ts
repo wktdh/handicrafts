@@ -3,7 +3,10 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   workers: 1,
-  timeout: 30_000,
+  // The first development-server transform of the large application module
+  // can exceed 30 seconds on a cold Windows filesystem. Assertion timeouts
+  // stay short so this only protects test setup and real user workflows.
+  timeout: 60_000,
   expect: { timeout: 8_000 },
   reporter: "list",
   use: { baseURL: "http://127.0.0.1:5174", headless: true, trace: "retain-on-failure", screenshot: "only-on-failure" },
