@@ -39,6 +39,38 @@ img {
   width: min(1180px, calc(100% - 48px));
   margin: auto;
 }
+.demo-mode-bar {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 5px 16px;
+  background: #242423;
+  color: #fff;
+  font-size: 13px;
+}
+.demo-mode-bar > span { color: #ffd9c6; }
+.demo-mode-bar > div { display: flex; gap: 4px; }
+.demo-mode-bar button {
+  min-height: 26px;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: #fff;
+}
+.demo-mode-bar button:hover,
+.demo-mode-bar button.active {
+  border-color: #f0ab80;
+  background: #4d4d48;
+}
+@media (max-width: 480px) {
+  .demo-mode-bar { justify-content: space-between; gap: 6px; padding-inline: 10px; font-size: 12px; }
+  .demo-mode-bar button { padding-inline: 6px; }
+}
 .site-header {
   background: #fffdf9;
   border-bottom: 1px solid #e7e4de;

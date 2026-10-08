@@ -1477,6 +1477,10 @@ function createInitialData(account: Account): AppData {
 // In production the frontend and API are served from the same origin through
 // the reverse proxy. Keep the API base relative by default; an absolute
 // VITE_API_BASE can still be supplied for a separately hosted API.
+const STATIC_DEMO =
+  (import.meta as ImportMeta & { env?: { VITE_STATIC_DEMO?: string } }).env
+    ?.VITE_STATIC_DEMO === "1";
+
 const API_BASE =
   (import.meta as ImportMeta & { env?: { VITE_API_BASE?: string } }).env
     ?.VITE_API_BASE ?? "";
@@ -1501,6 +1505,16 @@ function isApiRequest(input: RequestInfo | URL): boolean {
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const csrfFetch: typeof globalThis.fetch = async (input, init) => {
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+  if (STATIC_DEMO && isApiRequest(input)) {
+    const isWrite = !["GET", "HEAD", "OPTIONS"].includes(method);
+    return new Response(
+      JSON.stringify({ error: "This is a read-only demo. Changes are disabled." }),
+      {
+        status: isWrite ? 403 : 503,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+  }
   const needsCsrf = ["POST", "PUT", "PATCH", "DELETE"].includes(method) && isApiRequest(input);
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
@@ -2145,6 +2159,50 @@ const guestAccount: Account = {
   role: "buyer",
 };
 
+type DemoRole = "buyer" | "seller" | "admin";
+const demoAccounts: Record<DemoRole, Account> = {
+  buyer: { id: "demo-buyer", name: "Demo Buyer", password: "", role: "buyer" },
+  seller: { id: "demo-seller", name: "Demo Maker Studio", password: "", role: "seller" },
+  admin: { id: "demo-admin", name: "Demo Administrator", password: "", role: "admin" },
+};
+const demoRoleFromLocation = (): DemoRole => {
+  const role = new URLSearchParams(window.location.search).get("demo");
+  return role === "seller" || role === "admin" ? role : "buyer";
+};
+const demoAccountFromLocation = () =>
+  STATIC_DEMO ? demoAccounts[demoRoleFromLocation()] : null;
+const openDemoRole = (role: DemoRole) => {
+  const url = new URL(window.location.href);
+  url.pathname = import.meta.env.BASE_URL;
+  url.search = new URLSearchParams(
+    role === "seller" ? { demo: role, view: "studio" } : { demo: role },
+  ).toString();
+  url.hash = "";
+  window.location.assign(url.toString());
+};
+function DemoModeBar() {
+  if (!STATIC_DEMO) return null;
+  const role = demoRoleFromLocation();
+  return (
+    <nav className="demo-mode-bar" aria-label="Read-only demo navigation">
+      <span>Read-only demo</span>
+      <div>
+        {(["buyer", "seller", "admin"] as const).map((item) => (
+          <button
+            aria-current={role === item ? "page" : undefined}
+            className={role === item ? "active" : ""}
+            key={item}
+            onClick={() => openDemoRole(item)}
+            type="button"
+          >
+            {item === "buyer" ? "Storefront" : item === "seller" ? "Seller" : "Admin"}
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
 const authRouteMode = () =>
   new URLSearchParams(window.location.search).get("auth") === "register"
     ? "register"
@@ -2239,6 +2297,9 @@ export default function App() {
   const [showAuth, setShowAuth] = useState(isAuthRoute);
   const [sessionReady, setSessionReady] = useState(false);
   const [pathname, setPathname] = useState(() => window.location.pathname);
+  const demoAccount = demoAccountFromLocation();
+  const activeAccount = demoAccount || account;
+  const demoAdmin = demoAccount?.role === "admin";
   useEffect(() => {
     const syncPathname = () => setPathname(window.location.pathname);
     window.addEventListener("popstate", syncPathname);
@@ -2269,6 +2330,10 @@ export default function App() {
     return () => document.removeEventListener("error", handleImageError, true);
   }, []);
   useEffect(() => {
+    if (STATIC_DEMO) {
+      setSessionReady(true);
+      return;
+    }
     let active = true;
     const restoreSession = async () => {
       try {
@@ -2316,10 +2381,12 @@ export default function App() {
     setPathname(url.pathname);
   };
   const openAuth = () => {
+    if (STATIC_DEMO) return;
     setShowAuth(true);
     setAuthRoute(true);
   };
   const openSellerRegistration = () => {
+    if (STATIC_DEMO) return openDemoRole("seller");
     setShowAuth(true);
     setAuthRoute(true, "register", "seller");
   };
@@ -2398,6 +2465,7 @@ export default function App() {
     }
   };
   const logout = async () => {
+    if (STATIC_DEMO) return openDemoRole("buyer");
     try {
       await fetch(`${API_BASE}/api/auth/logout`, {
         method: "POST",
@@ -2425,8 +2493,8 @@ export default function App() {
   };
 
   const protectedRouteDenied =
-    (isAdminRoute(pathname) && account?.role !== "admin") ||
-    (isSellerDashboardRoute(pathname) && account?.role !== "seller");
+    (isAdminRoute(pathname) && activeAccount?.role !== "admin") ||
+    (isSellerDashboardRoute(pathname) && activeAccount?.role !== "seller");
   useEffect(() => {
     if (!sessionReady || !protectedRouteDenied) return;
     const url = new URL(window.location.href);
@@ -2480,26 +2548,32 @@ export default function App() {
     );
   if (protectedRouteDenied)
     return <main className="app-loading" aria-busy="true"><span /></main>;
-  return isAdminRoute(pathname) && account?.role === "admin" ? (
-    <Suspense fallback={<main className="app-loading" aria-busy="true"><span /></main>}>
-      <LazyAdminConsole
-        account={account}
-        onLogout={logout}
-        compressImageForUpload={compressImageForUpload}
-        setDocumentTitle={setDocumentTitle}
-      />
-    </Suspense>
+  return (isAdminRoute(pathname) && activeAccount?.role === "admin") || demoAdmin ? (
+    <>
+      <DemoModeBar />
+      <Suspense fallback={<main className="app-loading" aria-busy="true"><span /></main>}>
+        <LazyAdminConsole
+          account={activeAccount!}
+          onLogout={logout}
+          compressImageForUpload={compressImageForUpload}
+          setDocumentTitle={setDocumentTitle}
+        />
+      </Suspense>
+    </>
   ) : (
-    <Marketplace
-      key={account?.id || guestAccount.id}
-      account={account || guestAccount}
-      isGuest={!account}
-      onAuth={openAuth}
-      onSellerRegistration={openSellerRegistration}
-      onLogout={logout}
-      onAccountUpdated={updateAccount}
-      onAccountDeleted={() => setAccount(null)}
-    />
+    <>
+      <DemoModeBar />
+      <Marketplace
+        key={activeAccount?.id || guestAccount.id}
+        account={activeAccount || guestAccount}
+        isGuest={!activeAccount}
+        onAuth={openAuth}
+        onSellerRegistration={openSellerRegistration}
+        onLogout={logout}
+        onAccountUpdated={updateAccount}
+        onAccountDeleted={() => setAccount(null)}
+      />
+    </>
   );
 }
 
@@ -3110,6 +3184,8 @@ function Marketplace({
         ? "discover"
       : canRestoreInitialView
         ? (initialView as MarketplaceView)
+        : STATIC_DEMO && account.role === "seller"
+          ? "studio"
         : "home",
   );
   // Only the seller workspace is localized for merchant operations. All
@@ -3256,6 +3332,18 @@ function Marketplace({
     nextCategory = category,
   ) => {
     const url = new URL(window.location.href);
+    if (STATIC_DEMO) {
+      url.pathname = import.meta.env.BASE_URL;
+      if (nextView === "product") {
+        url.searchParams.set("product", String(nextProductId));
+        url.searchParams.delete("view");
+      } else {
+        url.searchParams.set("view", nextView);
+        url.searchParams.delete("product");
+      }
+      if (nextView !== "studio") url.searchParams.delete("tab");
+      return `${url.pathname}${url.search}${url.hash}`;
+    }
     const categoryDefinition = discoveryCategoryByName(nextCategory);
     if (nextView === "product") {
       url.pathname = "/";
@@ -4050,6 +4138,10 @@ function Marketplace({
     show("product", { productId: id, returnView: view });
   };
   const openProductInNewTab = (id: number) => {
+    if (STATIC_DEMO) {
+      window.open(marketplaceUrl("product", id), "_blank", "noopener");
+      return;
+    }
     const url = new URL(window.location.href);
     url.searchParams.set("product", String(id));
     url.searchParams.delete("view");

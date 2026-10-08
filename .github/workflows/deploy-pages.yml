@@ -36,6 +36,7 @@ jobs:
       - name: Build static site
         env:
           HANDICRAFTS_SKIP_PRERENDER: "1"
+          VITE_STATIC_DEMO: "1"
         run: |
           npx tsc -b
           npx vite build --base "/${{ github.event.repository.name }}/"
